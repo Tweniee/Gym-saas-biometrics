@@ -4,6 +4,8 @@ A Python desktop application for viewing users on Identix biometric devices that
 
 The application uses Python's standard library, including Tkinter. No vendor SDK or third-party Python packages are required.
 
+For a complete first-run walkthrough, including a direct LAN cable connection, computer IP setup, connectivity checks, and automatic fetching behavior, see [RUNNING.md](RUNNING.md).
+
 ## Features
 
 - Read device users, including UID, User ID, name, card number, role, and group.
@@ -90,3 +92,4 @@ Select one or more rows, then click **Activate selected** or **Deactivate select
 - `identix_manager.py` — TCP protocol client, background synchronization, and Tkinter interface.
 - `identix_state.json` — saved connection settings and local inactive flags.
 - `README.md` — setup and usage documentation.
+- `RUNNING.md` — step-by-step LAN setup, launch instructions, and troubleshooting.

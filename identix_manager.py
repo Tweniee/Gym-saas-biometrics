@@ -16,7 +16,9 @@ What it does
 Run:  python identix_manager.py
 """
 
+import ipaddress
 import json
+import logging
 import os
 import queue
 import socket
@@ -24,6 +26,8 @@ import struct
 import threading
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from logging.handlers import RotatingFileHandler
 from tkinter import messagebox, ttk
 
 # --------------------------------------------------------------------------- #
@@ -33,6 +37,64 @@ DEFAULT_CONFIG = {"ip": "192.168.1.201", "port": 4370, "commkey": 0, "cache_seco
 RETRY_SECONDS = 4          # how often to probe the port while the device is offline
 SOCKET_TIMEOUT = 8
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "identix_state.json")
+LOG_FILE = os.path.join(os.path.dirname(STATE_FILE), "logs", "identix_manager.log")
+LOG = logging.getLogger("identix_manager")
+MAX_SCAN_HOSTS = 256
+MAX_SCAN_PORTS = 32
+SCAN_TIMEOUT = 0.6
+
+
+def setup_logging(path=LOG_FILE):
+    """Keep detailed local logs without packet payloads or communication keys."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    handler = RotatingFileHandler(path, maxBytes=2 * 1024 * 1024,
+                                  backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(threadName)s] %(message)s"))
+    LOG.setLevel(logging.DEBUG)
+    LOG.addHandler(handler)
+    LOG.propagate = False
+    return handler
+
+
+def validate_config(cfg):
+    new = {"ip": str(ipaddress.IPv4Address(str(cfg["ip"]).strip())),
+           "port": int(cfg["port"]), "commkey": int(cfg["commkey"]),
+           "cache_seconds": max(5, int(cfg["cache_seconds"]))}
+    if not 1 <= new["port"] <= 65535:
+        raise ValueError("Port must be between 1 and 65535.")
+    if not 0 <= new["commkey"] <= 0xFFFFFFFF:
+        raise ValueError("Comm key must be between 0 and 4294967295.")
+    return new
+
+
+def parse_scan_targets(addresses, ports):
+    """Expand explicit IPv4 addresses/subnets and ports into a bounded scan."""
+    hosts, port_set = set(), set()
+    for token in addresses.split(","):
+        token = token.strip()
+        if not token:
+            raise ValueError("Enter IPv4 addresses or subnets, separated by commas.")
+        network = ipaddress.IPv4Network(token, strict=False)
+        if network.num_addresses > MAX_SCAN_HOSTS:
+            raise ValueError("Each subnet must be /24 or smaller (at most 256 addresses).")
+        hosts.update(str(ip) for ip in network.hosts())
+        if len(hosts) > MAX_SCAN_HOSTS:
+            raise ValueError("Scan at most 256 distinct hosts at once.")
+    for token in ports.split(","):
+        parts = token.strip().split("-")
+        if len(parts) not in (1, 2):
+            raise ValueError("Enter ports such as 4370,5005 or 4370-4375.")
+        start, end = int(parts[0]), int(parts[-1])
+        if not 1 <= start <= end <= 65535:
+            raise ValueError("Ports must be between 1 and 65535; ranges must increase.")
+        if end - start + 1 > MAX_SCAN_PORTS:
+            raise ValueError("Scan at most 32 distinct ports at once.")
+        port_set.update(range(start, end + 1))
+        if len(port_set) > MAX_SCAN_PORTS:
+            raise ValueError("Scan at most 32 distinct ports at once.")
+    return [(ip, port) for ip in sorted(hosts, key=ipaddress.IPv4Address)
+            for port in sorted(port_set)]
 
 # --------------------------------------------------------------------------- #
 #  ZK protocol (TCP framing)
@@ -87,7 +149,8 @@ def port_open(ip: str, port: int, timeout: float = 2.0) -> bool:
     try:
         with socket.create_connection((ip, port), timeout=timeout):
             return True
-    except OSError:
+    except OSError as exc:
+        LOG.debug("TCP probe failed target=%s:%s reason=%s", ip, port, exc)
         return False
 
 
@@ -147,8 +210,12 @@ class Device:
         if head[:4] != MAGIC:
             raise DeviceError("Bad packet header (not a ZK-protocol device?)")
         size = struct.unpack("<I", head[4:])[0]
+        if not 8 <= size <= 16 * 1024 * 1024:
+            raise DeviceError("Invalid ZK packet length")
         body = self._recv_exact(size)
         cmd, _chk, sess, rid = struct.unpack("<4H", body[:8])
+        LOG.debug("Protocol reply target=%s:%s command=%s bytes=%s",
+                  self.ip, self.port, cmd, size)
         return cmd, sess, rid, body[8:]
 
     def _drain(self):
@@ -172,6 +239,8 @@ class Device:
 
     def _cmd(self, command, data=b""):
         self._drain()
+        LOG.debug("Protocol request target=%s:%s command=%s payload_bytes=%s",
+                  self.ip, self.port, command, len(data))
         self.sock.sendall(self._build(command, data))
         cmd, sess, rid, payload = self._recv_packet()
         if command == CMD_CONNECT:
@@ -181,13 +250,16 @@ class Device:
 
     # ---- session ---------------------------------------------------------- #
     def connect(self):
+        LOG.info("Connecting target=%s:%s", self.ip, self.port)
         self.sock = socket.create_connection((self.ip, self.port), timeout=SOCKET_TIMEOUT)
         self.sock.settimeout(SOCKET_TIMEOUT)
         cmd, _ = self._cmd(CMD_CONNECT)
         if cmd == CMD_ACK_UNAUTH:
+            LOG.info("Device requires authentication target=%s:%s", self.ip, self.port)
             cmd, _ = self._cmd(CMD_AUTH, make_commkey(self.commkey, self.session_id))
         if cmd not in OK_CODES:
             raise DeviceError("Device refused connection (check comm key)")
+        LOG.info("Device session established target=%s:%s", self.ip, self.port)
 
     def close(self):
         if self.sock:
@@ -200,6 +272,7 @@ class Device:
             except Exception:
                 pass
             self.sock = None
+            LOG.debug("Device session closed target=%s:%s", self.ip, self.port)
 
     # ---- bulk reads ------------------------------------------------------- #
     def _read_chunk(self, start, size):
@@ -281,11 +354,20 @@ def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             s = json.load(f)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        LOG.warning("Saved state unavailable; using defaults: %s", exc)
         s = {}
-    cfg = dict(DEFAULT_CONFIG)
-    cfg.update(s.get("config", {}))
-    return cfg, set(s.get("inactive", []))
+    try:
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update(s.get("config", {}))
+        cfg = validate_config(cfg)
+        inactive = set(str(uid) for uid in s.get("inactive", []))
+    except (AttributeError, TypeError, ValueError):
+        LOG.warning("Invalid saved state; using defaults")
+        cfg, inactive = dict(DEFAULT_CONFIG), set()
+    LOG.info("Settings loaded target=%s:%s cache_seconds=%s inactive_count=%s",
+             cfg["ip"], cfg["port"], cfg["cache_seconds"], len(inactive))
+    return cfg, inactive
 
 
 def save_state(cfg, inactive):
@@ -293,6 +375,52 @@ def save_state(cfg, inactive):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"config": cfg, "inactive": sorted(inactive)}, f, indent=2)
     os.replace(tmp, STATE_FILE)
+    LOG.info("State saved target=%s:%s cache_seconds=%s inactive_count=%s",
+             cfg["ip"], cfg["port"], cfg["cache_seconds"], len(inactive))
+
+
+class DiscoveryWorker(threading.Thread):
+    """Probe only the supplied endpoints; open TCP is not a protocol guarantee."""
+    def __init__(self, targets, out_q):
+        super().__init__(daemon=True, name="discovery")
+        self.targets, self.q = targets, out_q
+        self.stop_event = threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def _probe(self, target):
+        if self.stop_event.is_set():
+            return False
+        opened = port_open(*target, timeout=SCAN_TIMEOUT)
+        LOG.debug("Discovery probe target=%s:%s open=%s", *target, opened)
+        return opened
+
+    def run(self):
+        checked, found = 0, 0
+        LOG.info("Discovery started endpoints=%s", len(self.targets))
+        try:
+            with ThreadPoolExecutor(max_workers=32, thread_name_prefix="probe") as pool:
+                pending = {pool.submit(self._probe, target): target for target in self.targets}
+                for future in as_completed(pending):
+                    if self.stop_event.is_set():
+                        for job in pending:
+                            job.cancel()
+                        break
+                    target = pending[future]
+                    if future.result():
+                        found += 1
+                        LOG.info("Discovery TCP port open target=%s:%s", *target)
+                        self.q.put(("found", *target))
+                    checked += 1
+                    self.q.put(("progress", checked, len(self.targets)))
+        except Exception as exc:
+            LOG.exception("Discovery failed")
+            self.q.put(("error", str(exc)))
+        finally:
+            LOG.info("Discovery finished checked=%s found=%s cancelled=%s",
+                     checked, found, self.stop_event.is_set())
+            self.q.put(("done", checked, found, self.stop_event.is_set()))
 
 
 # --------------------------------------------------------------------------- #
@@ -300,11 +428,16 @@ def save_state(cfg, inactive):
 # --------------------------------------------------------------------------- #
 class SyncWorker(threading.Thread):
     def __init__(self, get_cfg, out_q):
-        super().__init__(daemon=True)
+        super().__init__(daemon=True, name="device-sync")
         self.get_cfg, self.q = get_cfg, out_q
         self.force = threading.Event()
         self.wake = threading.Event()
         self.last_sync = None
+        self.stop_event = threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
+        self.wake.set()
 
     def refresh_now(self):
         self.force.set()
@@ -315,24 +448,37 @@ class SyncWorker(threading.Thread):
         self.wake.clear()
 
     def run(self):
-        while True:
+        while not self.stop_event.is_set():
             cfg = self.get_cfg()
             age = None if self.last_sync is None else time.time() - self.last_sync
             due = self.force.is_set() or age is None or age >= cfg["cache_seconds"]
             if not due:
                 self._sleep(1)
                 continue
+            self.force.clear()
+            LOG.info("Fetch attempt target=%s:%s", cfg["ip"], cfg["port"])
             if not port_open(cfg["ip"], cfg["port"]):
-                self.q.put(("offline", None))          # keep cache, keep waiting
+                LOG.warning("Device offline target=%s:%s; retry wait=%ss",
+                            cfg["ip"], cfg["port"], RETRY_SECONDS)
+                self.q.put(("offline", None, cfg))      # keep cache, keep waiting
                 self._sleep(RETRY_SECONDS)
                 continue
             try:
                 users = Device(cfg["ip"], cfg["port"], cfg["commkey"]).fetch_users()
+                if self.stop_event.is_set():
+                    break
+                if cfg != self.get_cfg():
+                    LOG.info("Discarded read from previous settings")
+                    self.force.set()
+                    continue
                 self.last_sync = time.time()
-                self.force.clear()
-                self.q.put(("users", users, self.last_sync))
+                LOG.info("Fetch succeeded target=%s:%s users=%s",
+                         cfg["ip"], cfg["port"], len(users))
+                self.q.put(("users", users, self.last_sync, cfg))
             except Exception as e:                     # noqa: BLE001
-                self.q.put(("error", str(e)))
+                LOG.exception("Fetch failed target=%s:%s; retry wait=%ss",
+                              cfg["ip"], cfg["port"], RETRY_SECONDS)
+                self.q.put(("error", str(e), cfg))
                 self._sleep(RETRY_SECONDS)
 
 
