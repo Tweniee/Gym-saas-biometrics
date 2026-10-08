@@ -37,6 +37,8 @@ The repository currently contains these sample settings:
 
 The sample IP is not a detected address. Replace it with your machine's address through the app.
 
+If you have little setup time: configure Ethernet as described below, launch the app, and use **Discover devices** if the IP or port is uncertain. Once the right target is saved, future launches fetch automatically.
+
 ## 2. Connect the computer and machine
 
 ### Option A: Ethernet cable directly between them
@@ -153,6 +155,21 @@ After a successful read, the table displays **UID**, **User ID**, **Name**, **Ca
 
 Use **Clear** to reset search and filters if expected users are hidden. Use **Refresh now** to request a new read before the interval expires.
 
+### Find an uncertain IP or TCP port
+
+1. Click **Discover devices** in the main window.
+2. In **IPs / subnet**, enter your actual device LAN, such as `192.168.1.0/24`, or individual addresses such as `192.168.1.201,192.168.1.202`.
+3. In **TCP ports**, enter candidate ports, such as `4370,5005`, or a range such as `4370-4375`. `5005` is only an input example, not a guaranteed Identix port.
+4. Click **Start scan**. The background scan shows progress and lists open TCP endpoints. You can click **Cancel scan** to stop it.
+5. Select a result and click **Use selected & fetch** (or double-click the row). This saves the selected IP/port and requests users using the **Comm key** currently entered in the main window.
+6. Check the main window's status for **Synced**. If authentication fails, enter the correct communication key and click **Apply & fetch**.
+
+Discovery checks only the entered addresses and ports. It does not run automatically on launch or when a cable is inserted. The suggested subnet comes from the saved device IP with a `/24` mask; verify it against your Ethernet settings. The initial port candidates are the saved port and `4370`. A different port must be included in your scan input or entered directly in the main window.
+
+Scans support up to 256 distinct hosts and 32 distinct ports, with 32 concurrent probes and a 0.6-second connection timeout per endpoint. Subnets must be `/24` or smaller. For a known device IP, checking only that IP and a few ports is fastest. An open TCP port can belong to another service; a successful device read is the compatibility check. Discovery does not fix subnet, cabling, routing, or firewall problems.
+
+You can check multiple IPs and ports in discovery, but the main table syncs **one selected device at a time**. Switching to another IP/port clears the previous table while fetching the new target, so another machine's cached users are not shown as the new target's users. Local inactive flags are still shared by User ID in the single state file.
+
 ## 6. What happens on later launches and disconnections?
 
 | Situation | App behavior |
@@ -167,13 +184,42 @@ Use **Clear** to reset search and filters if expected users are hidden. Use **Re
 
 The status line is based on the latest read/probe result. It may still show the last successful sync until another read detects a disconnection. The app must remain open for automatic refresh and retries to continue.
 
+Cable insertion/removal is inferred from connection attempts; the app does not monitor operating-system Ethernet-link events. If the app is waiting for its first connection or retrying a failed read, connecting the cable allows a later retry to fetch automatically. After a recent successful sync, use **Refresh now** for an immediate read rather than waiting for the cache interval.
+
 ## 7. Saved settings and user status
 
 The app stores connection settings and locally inactive User IDs in `identix_state.json` beside the script. The repository directory must be writable to save changes. The communication key is stored as plain JSON, so keep this file private if you configure a key.
 
 **Activate selected** and **Deactivate selected** change only the local status in this app. They do not disable a user on the biometric machine, prevent authentication, or enforce gym membership/access rules. A displayed **Active** status is not a device access-permission check.
 
-This project displays user records. It does not currently provide attendance-log syncing, fingerprint-template backup, automatic network discovery, device enrollment, or device-side access enforcement.
+This project displays user records. It does not currently provide attendance-log syncing, fingerprint-template backup, automatic discovery on cable insertion, device enrollment, or device-side access enforcement.
+
+## 8. Logging and diagnostics
+
+Logging starts automatically when you launch `identix_manager.py`. The app creates:
+
+```text
+logs/identix_manager.log
+```
+
+This path is relative to the script directory, regardless of the terminal's working directory. Click **View logs** in the main window, then **Refresh logs** to load new entries. The viewer displays the latest roughly 200 KB from the current file. The full file and rotated backups are available in the `logs` directory.
+
+Entries contain local timestamps, severity, thread name, and event details. They cover:
+
+- Application startup, shutdown, and UI failures.
+- Settings loading/saving, validation failures, and applied IP/port changes.
+- Automatic/manual fetch attempts, offline probes, retries, authentication requirements, read failures, and successful user counts.
+- Protocol command/reply numbers and byte counts, without raw packet payloads.
+- Discovery start, each probe result, open endpoints, cancellation, completion, and selected targets.
+- Refresh buttons, log viewing, search/filter changes, sorting, table selection, and local activation/deactivation actions.
+
+Logs exclude communication keys, typed search text, names, card numbers, fingerprint templates, and raw user records. Table-selection logs include UIDs; local activation/deactivation logs include the affected User IDs. The separate `identix_state.json` still stores the communication key in plain JSON.
+
+Files rotate at 2 MiB, retaining three backups (`.1`, `.2`, `.3`), for approximately 8 MiB total. Older entries eventually expire. The `logs` directory is ignored by Git. The script directory must be writable to create logs and save state.
+
+These are **application diagnostic logs**, not a record of every action performed on the device or traffic sent by other programs to that IP. The app does not enumerate every allowed command, scan UDP ports, or retrieve biometric attendance/access events. TCP discovery reports reachability; the subsequent user read checks this app's supported operation.
+
+For a connection issue, keep the final error and the relevant IP/port entries from the log alongside the machine's model and firmware version.
 
 ## Troubleshooting
 
@@ -186,7 +232,21 @@ This project displays user records. It does not currently provide attendance-log
 | `Could not determine user record size`, unsupported record format, unexpected replies, or repeated read failures | Check model/firmware protocol compatibility. The current reader handles 28-byte and 72-byte user records; another format may require code changes. |
 | Synced but no rows | Check enrolled users on the machine, confirm you connected to the intended device, and click **Clear** to remove filters. |
 | Newly enrolled user missing | Click **Refresh now** or wait for the next successful read. |
+| Unsure of the device IP or port | Use **Discover devices** with the correct Ethernet subnet and candidate ports. Select a result and fetch to verify it. |
+| Scan lists an open port but the read fails | Check protocol compatibility and the communication key. An open port alone is not a biometric-device identification. |
+| Scan finds nothing | Check Ethernet settings/link, actual subnet, and candidate ports. The device may be listening on an unlisted port or use an unsupported protocol. |
 | Old rows still visible while offline | These are cached rows from the last successful read during this session. Check the bottom status line. |
 | Settings fail to save | Check write permission for the directory containing `identix_state.json`. |
+| Launch fails while creating logs | Check write permission for the script directory and its `logs` subdirectory. |
+
+## Developer verification
+
+Run the simulated-device tests from the repository directory:
+
+```bash
+python3 test_identix_manager.py -v
+```
+
+On Windows, use `py test_identix_manager.py -v`. These tests do not start a GUI or scan your LAN. They check discovery input limits, background results/cancellation, automatic fetching and retry behavior, switching targets during a read, state saving, and authentication-log redaction.
 
 These instructions describe the behavior implemented in `identix_manager.py`. A successful read from your specific machine still needs to be verified with that machine connected; no physical-device compatibility test is implied by this guide.

@@ -10,6 +10,8 @@ What it does
   * If the device is unreachable when a refresh is due, it keeps showing the cached
     list and waits; as soon as the TCP port answers, it re-fetches automatically.
   * UI: search, filter (status / role), click-to-sort columns.
+  * Discover open TCP ports across supplied IPv4 addresses/subnets.
+  * Rotating file logs for application actions and connection diagnostics.
   * Activate / Deactivate users. This flag lives in YOUR system (identix_state.json),
     keyed by User ID -- see NOTE at the bottom about enforcing it on the device.
 
@@ -29,6 +31,7 @@ import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
 from tkinter import messagebox, ttk
+from tkinter.scrolledtext import ScrolledText
 
 # --------------------------------------------------------------------------- #
 #  Settings (editable in the UI too; saved to identix_state.json)
@@ -433,6 +436,7 @@ class SyncWorker(threading.Thread):
         self.force = threading.Event()
         self.wake = threading.Event()
         self.last_sync = None
+        self.last_sync_cfg = None
         self.stop_event = threading.Event()
 
     def stop(self):
@@ -451,13 +455,15 @@ class SyncWorker(threading.Thread):
         while not self.stop_event.is_set():
             cfg = self.get_cfg()
             age = None if self.last_sync is None else time.time() - self.last_sync
-            due = self.force.is_set() or age is None or age >= cfg["cache_seconds"]
+            due = (self.force.is_set() or cfg != self.last_sync_cfg
+                   or age is None or age >= cfg["cache_seconds"])
             if not due:
                 self._sleep(1)
                 continue
             self.force.clear()
             LOG.info("Fetch attempt target=%s:%s", cfg["ip"], cfg["port"])
             if not port_open(cfg["ip"], cfg["port"]):
+                self.force.set()
                 LOG.warning("Device offline target=%s:%s; retry wait=%ss",
                             cfg["ip"], cfg["port"], RETRY_SECONDS)
                 self.q.put(("offline", None, cfg))      # keep cache, keep waiting
@@ -472,10 +478,12 @@ class SyncWorker(threading.Thread):
                     self.force.set()
                     continue
                 self.last_sync = time.time()
+                self.last_sync_cfg = cfg
                 LOG.info("Fetch succeeded target=%s:%s users=%s",
                          cfg["ip"], cfg["port"], len(users))
                 self.q.put(("users", users, self.last_sync, cfg))
             except Exception as e:                     # noqa: BLE001
+                self.force.set()
                 LOG.exception("Fetch failed target=%s:%s; retry wait=%ss",
                               cfg["ip"], cfg["port"], RETRY_SECONDS)
                 self.q.put(("error", str(e), cfg))
@@ -508,11 +516,30 @@ class App(tk.Tk):
         self.last_error = ""
         self.sort_col, self.sort_rev = "uid", False
         self.q = queue.Queue()
+        self.discovery_window = None
+        self.discovery_after = None
+        self.discovery_worker = None
+        self.discovery_q = queue.Queue()
+        self.log_window = None
+        self._view_signature = None
         self._build_ui()
         self.worker = SyncWorker(self._cfg_snapshot, self.q)
         self.worker.start()
         self.after(200, self._poll_queue)
         self.after(1000, self._tick)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        LOG.info("Application ready; automatic initial fetch started")
+
+    def _close(self):
+        LOG.info("Application closing")
+        self.worker.stop()
+        if self.discovery_worker:
+            self.discovery_worker.stop()
+        self.destroy()
+
+    def report_callback_exception(self, exc, value, traceback):
+        LOG.error("UI action failed", exc_info=(exc, value, traceback))
+        messagebox.showerror("Action failed", f"{value}\nSee View logs for details.", parent=self)
 
     # ---- config ----------------------------------------------------------- #
     def _cfg_snapshot(self):
@@ -521,16 +548,30 @@ class App(tk.Tk):
 
     def _apply_config(self):
         try:
-            new = {"ip": self.v_ip.get().strip(), "port": int(self.v_port.get()),
-                   "commkey": int(self.v_key.get()),
-                   "cache_seconds": max(5, int(self.v_cache.get()))}
-        except ValueError:
-            messagebox.showerror("Invalid settings", "Port, comm key and cache must be numbers.")
-            return
+            new = validate_config({"ip": self.v_ip.get(), "port": self.v_port.get(),
+                                   "commkey": self.v_key.get(),
+                                   "cache_seconds": self.v_cache.get()})
+        except ValueError as exc:
+            LOG.warning("Settings rejected: invalid address or numeric settings")
+            messagebox.showerror("Invalid settings", str(exc), parent=self)
+            return False
+        try:
+            save_state(new, self.inactive)
+        except OSError as exc:
+            LOG.exception("Settings could not be saved")
+            messagebox.showerror("Cannot save settings", str(exc), parent=self)
+            return False
         with self.cfg_lock:
+            changed_target = (self.cfg["ip"], self.cfg["port"]) != (new["ip"], new["port"])
             self.cfg = new
-        save_state(new, self.inactive)
+        if changed_target:
+            self.users, self.last_sync = [], None
+            self.refresh_view()
+        self.conn_state, self.last_error = "waiting", ""
+        self.v_cache.set(str(new["cache_seconds"]))
+        LOG.info("Apply & fetch clicked target=%s:%s", new["ip"], new["port"])
         self.worker.refresh_now()
+        return True
 
     # ---- layout ----------------------------------------------------------- #
     def _build_ui(self):
@@ -543,9 +584,16 @@ class App(tk.Tk):
         for label, var, w in (("Device IP", self.v_ip, 15), ("Port", self.v_port, 6),
                               ("Comm key", self.v_key, 7), ("Cache (s)", self.v_cache, 6)):
             ttk.Label(top, text=label).pack(side="left", padx=(0, 3))
-            ttk.Entry(top, textvariable=var, width=w).pack(side="left", padx=(0, 10))
+            ttk.Entry(top, textvariable=var, width=w,
+                      show="*" if var is self.v_key else "").pack(side="left", padx=(0, 10))
         ttk.Button(top, text="Apply & fetch", command=self._apply_config).pack(side="left")
         ttk.Button(top, text="Refresh now", command=self.worker_refresh).pack(side="left", padx=6)
+
+        tools = ttk.Frame(self, padding=(8, 6, 8, 0))
+        tools.pack(fill="x")
+        ttk.Button(tools, text="Discover devices", command=self._show_discovery).pack(side="left")
+        ttk.Button(tools, text="View logs", command=self._show_logs).pack(side="left", padx=6)
+        ttk.Label(tools, text="Auto-fetch on launch • retries while offline • logs saved locally").pack(side="left")
 
         flt = ttk.Frame(self, padding=(8, 8, 8, 0))
         flt.pack(fill="x")
@@ -577,6 +625,7 @@ class App(tk.Tk):
         self.tree.tag_configure("inactive", foreground="#9a9a9a")
         sb = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
+        self.tree.bind("<<TreeviewSelect>>", self._log_selection)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
@@ -592,18 +641,176 @@ class App(tk.Tk):
         self._update_headings()
 
     def worker_refresh(self):
+        LOG.info("Refresh now clicked")
         self.worker.refresh_now()
 
+    # ---- discovery and diagnostics --------------------------------------- #
+    def _show_discovery(self):
+        LOG.info("Discover devices opened")
+        if self.discovery_window and self.discovery_window.winfo_exists():
+            self.discovery_window.lift()
+            return
+        win = self.discovery_window = tk.Toplevel(self)
+        win.title("Find a device IP and TCP port")
+        win.geometry("780x460")
+        win.protocol("WM_DELETE_WINDOW", self._close_discovery)
+        self.discovery_q = queue.Queue()
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Enter your device LAN's IPv4 addresses or subnet. "
+                  "The suggested /24 comes from the saved IP; verify it matches Ethernet.",
+                  wraplength=740).pack(anchor="w")
+        network = str(ipaddress.IPv4Network(self._cfg_snapshot()["ip"] + "/24", strict=False))
+        self.v_scan_ips = tk.StringVar(value=network)
+        self.v_scan_ports = tk.StringVar(value=",".join(dict.fromkeys(
+            [str(self._cfg_snapshot()["port"]), "4370"])))
+        inputs = ttk.Frame(frame)
+        inputs.pack(fill="x", pady=10)
+        ttk.Label(inputs, text="IPs / subnet").pack(side="left")
+        ttk.Entry(inputs, textvariable=self.v_scan_ips, width=36).pack(side="left", padx=6)
+        ttk.Label(inputs, text="TCP ports").pack(side="left")
+        ttk.Entry(inputs, textvariable=self.v_scan_ports, width=23).pack(side="left", padx=6)
+        ttk.Label(frame, text="Examples: 192.168.1.201,192.168.1.202 or 192.168.1.0/24; "
+                  "ports 4370,5005 or 4370-4375. Up to 256 hosts and 32 ports.",
+                  wraplength=740).pack(anchor="w")
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x", pady=8)
+        self.scan_start = ttk.Button(actions, text="Start scan", command=self._start_scan)
+        self.scan_start.pack(side="left")
+        self.scan_stop = ttk.Button(actions, text="Cancel scan", command=self._cancel_scan,
+                                    state="disabled")
+        self.scan_stop.pack(side="left", padx=6)
+        ttk.Button(actions, text="Use selected & fetch", command=self._use_discovered).pack(side="left")
+        self.scan_results = ttk.Treeview(frame, columns=("ip", "port", "result"),
+                                        show="headings", selectmode="browse")
+        for key, label, width in (("ip", "IP address", 180), ("port", "TCP port", 90),
+                                  ("result", "Result", 430)):
+            self.scan_results.heading(key, text=label)
+            self.scan_results.column(key, width=width)
+        self.scan_results.pack(fill="both", expand=True)
+        self.scan_results.bind("<Double-1>", lambda _e: self._use_discovered())
+        self.scan_status = ttk.Label(frame, text="Ready. Open TCP ports need a device read to confirm compatibility.")
+        self.scan_status.pack(anchor="w", pady=(8, 0))
+        self.discovery_after = self.after(100, self._poll_discovery)
+
+    def _start_scan(self):
+        if self.discovery_worker and self.discovery_worker.is_alive():
+            return
+        try:
+            targets = parse_scan_targets(self.v_scan_ips.get(), self.v_scan_ports.get())
+        except ValueError as exc:
+            LOG.warning("Discovery input rejected")
+            messagebox.showerror("Invalid scan settings", str(exc), parent=self.discovery_window)
+            return
+        LOG.info("Start scan clicked hosts_and_ports=%s", len(targets))
+        self.scan_results.delete(*self.scan_results.get_children())
+        self.discovery_q = queue.Queue()
+        self.scan_status.config(text=f"Scanning 0/{len(targets)} endpoints...")
+        self.scan_start.config(state="disabled")
+        self.scan_stop.config(state="normal")
+        self.discovery_worker = DiscoveryWorker(targets, self.discovery_q)
+        self.discovery_worker.start()
+
+    def _cancel_scan(self):
+        if self.discovery_worker and self.discovery_worker.is_alive():
+            LOG.info("Discovery cancellation requested")
+            self.discovery_worker.stop()
+            self.scan_status.config(text="Cancelling scan...")
+            self.scan_stop.config(state="disabled")
+
+    def _close_discovery(self):
+        self._cancel_scan()
+        if self.discovery_after is not None:
+            self.after_cancel(self.discovery_after)
+            self.discovery_after = None
+        self.discovery_worker = None
+        self.discovery_window.destroy()
+        self.discovery_window = None
+        LOG.info("Discovery window closed")
+
+    def _poll_discovery(self):
+        if not self.discovery_window or not self.discovery_window.winfo_exists():
+            return
+        try:
+            while True:
+                msg = self.discovery_q.get_nowait()
+                if msg[0] == "found":
+                    self.scan_results.insert("", "end", values=(
+                        msg[1], msg[2], "TCP open; device protocol not yet verified"))
+                elif msg[0] == "progress":
+                    self.scan_status.config(text=f"Scanning {msg[1]}/{msg[2]} endpoints...")
+                elif msg[0] == "error":
+                    messagebox.showerror("Scan failed", msg[1], parent=self.discovery_window)
+                elif msg[0] == "done":
+                    label = "Cancelled" if msg[3] else "Finished"
+                    self.scan_status.config(text=f"{label}: checked {msg[1]} endpoints; "
+                                            f"{msg[2]} open. Select a result, then Use selected & fetch.")
+                    self.scan_start.config(state="normal")
+                    self.scan_stop.config(state="disabled")
+        except queue.Empty:
+            pass
+        self.discovery_after = self.after(100, self._poll_discovery)
+
+    def _use_discovered(self):
+        selected = self.scan_results.selection()
+        if not selected:
+            messagebox.showinfo("Select a result", "Select an open IP/port first.",
+                                parent=self.discovery_window)
+            return
+        ip, port, _result = self.scan_results.item(selected[0], "values")
+        self.v_ip.set(ip)
+        self.v_port.set(str(port))
+        LOG.info("Discovery target selected target=%s:%s", ip, port)
+        if self._apply_config():
+            self.scan_status.config(text=f"Fetching users from {ip}:{port}. "
+                                    "Check the main window's sync status; the current Comm key is used.")
+            self.lift()
+
+    def _show_logs(self):
+        LOG.info("View logs opened")
+        if self.log_window and self.log_window.winfo_exists():
+            self.log_window.lift()
+            self._refresh_logs()
+            return
+        win = self.log_window = tk.Toplevel(self)
+        win.title("Application logs")
+        win.geometry("960x540")
+        ttk.Label(win, text=LOG_FILE, wraplength=920, padding=8).pack(anchor="w")
+        ttk.Button(win, text="Refresh logs", command=self._refresh_logs).pack(anchor="w", padx=8)
+        self.log_text = ScrolledText(win, wrap="none", font="TkFixedFont")
+        self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
+        self._refresh_logs()
+
+    def _refresh_logs(self):
+        LOG.info("Log view refreshed")
+        try:
+            with open(LOG_FILE, "rb") as handle:
+                size = handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, size - 200_000))
+                content = handle.read().decode("utf-8", "replace")
+        except OSError as exc:
+            content = f"Could not read log file: {exc}"
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.insert("end", content)
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
     def _clear_filters(self):
+        LOG.info("Clear filters clicked")
         self.v_search.set("")
         self.v_status.set("All")
         self.v_role.set("All")
         self.refresh_view()
 
+    def _log_selection(self, _event=None):
+        LOG.info("Table selection changed uids=%s", json.dumps(list(self.tree.selection())))
+
     # ---- sorting / filtering ---------------------------------------------- #
     def sort_by(self, col):
         self.sort_rev = (not self.sort_rev) if self.sort_col == col else False
         self.sort_col = col
+        LOG.info("Sort changed column=%s descending=%s", col, self.sort_rev)
         self._update_headings()
         self.refresh_view()
 
@@ -618,6 +825,11 @@ class App(tk.Tk):
     def refresh_view(self):
         rows = [self._row(u) for u in self.users]
         q = self.v_search.get().strip().lower()
+        signature = (q, self.v_status.get(), self.v_role.get())
+        if signature != self._view_signature:
+            LOG.info("Filters changed search_length=%s status=%s role=%s",
+                     len(q), self.v_status.get(), self.v_role.get())
+            self._view_signature = signature
         if q:
             rows = [r for r in rows if any(q in str(r[k]).lower()
                                            for k in ("uid", "user_id", "name", "card", "role", "group"))]
@@ -646,16 +858,21 @@ class App(tk.Tk):
     def set_active(self, active):
         sel = self.tree.selection()
         if not sel:
+            LOG.info("Local status action ignored: no selection")
             messagebox.showinfo("Nothing selected", "Select one or more users first.")
             return
         by_uid = {str(u["uid"]): u for u in self.users}
         ids = [by_uid[i]["user_id"] for i in sel if i in by_uid]
         if not active and not messagebox.askyesno(
                 "Deactivate", f"Deactivate {len(ids)} user(s) in your system?"):
+            LOG.info("Local deactivation cancelled count=%s", len(ids))
             return
+        updated = set(self.inactive)
         for uid in ids:
-            (self.inactive.discard if active else self.inactive.add)(uid)
-        save_state(self._cfg_snapshot(), self.inactive)
+            (updated.discard if active else updated.add)(uid)
+        save_state(self._cfg_snapshot(), updated)
+        self.inactive = updated
+        LOG.info("Local user status changed active=%s user_ids=%s", active, json.dumps(ids))
         self.refresh_view()
 
     # ---- worker messages / status line ------------------------------------ #
@@ -663,6 +880,8 @@ class App(tk.Tk):
         try:
             while True:
                 msg = self.q.get_nowait()
+                if msg[-1] != self._cfg_snapshot():
+                    continue
                 if msg[0] == "users":
                     self.users, self.last_sync = msg[1], msg[2]
                     self.conn_state, self.last_error = "online", ""
@@ -694,7 +913,16 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    setup_logging()
+    LOG.info("Application starting")
+    try:
+        App().mainloop()
+    except Exception:
+        LOG.exception("Application failed")
+        raise
+    finally:
+        LOG.info("Application exited")
+        logging.shutdown()
 
 # NOTE on Activate/Deactivate
 #   The ZK protocol has no standard "disabled" flag on a user record, so the flag is kept in

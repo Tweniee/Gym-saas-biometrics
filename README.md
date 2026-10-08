@@ -15,6 +15,8 @@ For a complete first-run walkthrough, including a direct LAN cable connection, c
 - Refresh automatically with a configurable cache interval, or fetch immediately with **Refresh now**.
 - Keep the current user list visible while the device is offline and retry automatically.
 - Save connection settings and inactive User IDs between sessions.
+- Discover open TCP ports on supplied IPv4 addresses or subnets, then select a target and fetch users.
+- Record connection attempts, retries, protocol command metadata, sync results, and UI actions in rotating local logs; view them from the app.
 
 ## Requirements
 
@@ -45,6 +47,12 @@ To check that Tkinter is available, run `python3 -m tkinter`; it should open a s
 4. Click **Apply & fetch** to save the settings and request the user list.
 
 The status line shows connection errors, the last successful sync time, and the next scheduled read. Click **Refresh now** to request a read before the cache interval expires.
+
+The app also fetches automatically on launch using saved settings and retries failed reads. Plugging in a LAN cable does not launch the app or discover addresses. If the IP or port is uncertain, click **Discover devices**, supply your device subnet/IPs and candidate ports, then click **Start scan**. Select an open endpoint and click **Use selected & fetch**. An open TCP port is not proof of a compatible biometric device. The app reads from one selected target at a time.
+
+### Logs
+
+Click **View logs** to inspect `logs/identix_manager.log`, or **Refresh logs** in that window to load newer entries. Logs rotate at 2 MiB with three backups. They include application activity and connection diagnostics, not unrelated network traffic, device-side attendance events, or a list of all commands a device supports. Communication keys and raw user-record payloads are excluded; selected UIDs and User IDs changed by local status actions are included. Logs are ignored by Git.
 
 ### Configuration
 
@@ -93,3 +101,5 @@ Select one or more rows, then click **Activate selected** or **Deactivate select
 - `identix_state.json` — saved connection settings and local inactive flags.
 - `README.md` — setup and usage documentation.
 - `RUNNING.md` — step-by-step LAN setup, launch instructions, and troubleshooting.
+- `test_identix_manager.py` — simulated-device behavior tests (`python3 test_identix_manager.py -v`).
+- `logs/identix_manager.log` — runtime diagnostics, created on launch (not committed).
