@@ -1,0 +1,457 @@
+diff --git a/src/app/app.routes.ts b/src/app/app.routes.ts
+index f47298f..3d73877 100644
+--- a/src/app/app.routes.ts
++++ b/src/app/app.routes.ts
+@@ -1,3 +1,4 @@
++import { biometricRoleGuard } from './guards/biometric-role.guard';
+ import { Routes } from '@angular/router';
+ import { authGuard } from './guards/auth.guard';
+ import { loginGuard } from './guards/login.guard';
+@@ -375,6 +376,12 @@ export const routes: Routes = [
+           breadcrumbUrl: '/support-tickets',
+         },
+       },
++      {
++        path: 'biometrics',
++        loadComponent: () => import('./views/biometric/biometric.component').then(m => m.BiometricComponent),
++        canActivate: [biometricRoleGuard, permissionGuard('attendance')],
++        data: { title: 'Biometrics' },
++      },
+       {
+         path: 'attendance',
+         loadComponent: () =>
+diff --git a/src/app/layout/default-layout/_nav.ts b/src/app/layout/default-layout/_nav.ts
+index 9ee32c1..2291357 100644
+--- a/src/app/layout/default-layout/_nav.ts
++++ b/src/app/layout/default-layout/_nav.ts
+@@ -58,6 +58,11 @@ export const navItems: INavData[] = [
+     url: '/attendance',
+     iconComponent: { name: 'cil-calendar' },
+   },
++  {
++    name: 'Biometrics',
++    url: '/biometrics',
++    iconComponent: { name: 'cil-shield-alt' },
++  },
+   {
+     name: 'Leads',
+     url: '/leads',
+diff --git a/src/app/layout/default-layout/default-layout.component.ts b/src/app/layout/default-layout/default-layout.component.ts
+index 2181315..4bb0ef3 100644
+--- a/src/app/layout/default-layout/default-layout.component.ts
++++ b/src/app/layout/default-layout/default-layout.component.ts
+@@ -44,6 +44,7 @@ const URL_TO_MODULE_CODE: Record<string, string> = {
+   '/staff-incentives': 'staff_incentives',
+   '/financial-overview': 'financial_overview',
+   '/attendance': 'attendance',
++  '/biometrics': 'attendance',
+   '/staff': 'staff',
+   '/support-tickets': 'support_tickets',
+   '/trigger-notifications': 'trigger_notifications',
+@@ -202,6 +203,7 @@ export class DefaultLayoutComponent {
+ 
+       const url = typeof item.url === 'string' ? item.url : '';
+       if (SUPER_ADMIN_ONLY_URLS.has(url)) return false;
++      if (url === '/biometrics' && ['member', 'trainer'].includes(role ?? '')) return false;
+ 
+       const moduleCode = URL_TO_MODULE_CODE[url];
+       if (!moduleCode) return true;
+diff --git a/src/app/guards/biometric-role.guard.ts b/src/app/guards/biometric-role.guard.ts
+new file mode 100644
+index 0000000..d4c07de
+--- /dev/null
++++ b/src/app/guards/biometric-role.guard.ts
+@@ -0,0 +1,10 @@
++import { inject } from '@angular/core';
++import { CanActivateFn, Router } from '@angular/router';
++import { AuthService } from '../services/auth.service';
++
++// Attendance.read is also granted to members/trainers for their own history.
++// The biometric management screen is a staff resource; API enforces this too.
++export const biometricRoleGuard: CanActivateFn = () => {
++  const role = inject(AuthService).getUser()?.role?.name?.toLowerCase();
++  return role && !['member', 'trainer'].includes(role) ? true : inject(Router).createUrlTree(['/notification-center']);
++};
+diff --git a/src/app/services/biometric.service.ts b/src/app/services/biometric.service.ts
+new file mode 100644
+index 0000000..219d366
+--- /dev/null
++++ b/src/app/services/biometric.service.ts
+@@ -0,0 +1,37 @@
++import { inject, Injectable } from '@angular/core';
++import { HttpClient } from '@angular/common/http';
++import { map } from 'rxjs';
++import { environment } from '../../environments/environment';
++
++export interface BiometricConnector {
++  _id: string; online: boolean; revokedAt?: string; appVersion: string; lastHeartbeat?: string;
++  health?: { lastDeviceCommunication?: string; lastAttendanceFetch?: string; lastAcknowledgedUpload?: string; pendingCount: number; operation?: string; errorCode?: string };
++}
++export interface BiometricDevice {
++  _id: string; connectorId: string; adapter: string; identity?: string; ip: string; port: number; timezone: string; historySince: string;
++  capabilities: { attendance: boolean; access: boolean; expiry: boolean };
++  report?: { reachable: boolean; lastCommunication?: string; errorCode?: string };
++}
++export interface DeviceConfiguration { connectorId: string; adapter: string; ip: string; port: number; timezone: string; historySince: string; }
++export interface DiscoveryCandidate { identity: string; adapter: string; ip: string; port: number; }
++export interface BiometricCommand {
++  _id: string; connectorId: string; deviceId?: string; type: string; status: string; createdAt: string;
++  result?: { count?: number; errorCode?: string; candidates?: DiscoveryCandidate[] };
++}
++export interface BiometricStatus {
++  connectors: BiometricConnector[]; devices: BiometricDevice[]; commands: BiometricCommand[];
++  unresolved: { _id: { deviceId: string; deviceUserId: string }; count: number }[];
++  checkpoints: { deviceId: string; acknowledgedAt: string; dataGap: boolean }[];
++  pendingAccess: number; offlineAfterSeconds: number;
++  accessStates: { deviceId: string; memberId: string; enabled: boolean; version: number; confirmedVersion?: number }[];
++  download: { url: string; sha256: string } | null;
++}
++@Injectable({ providedIn: 'root' })
++export class BiometricService {
++  private readonly http = inject(HttpClient);
++  private base(gym: string) { return environment.apiUrl + '/gyms/' + encodeURIComponent(gym) + '/biometric'; }
++  status(gym: string) { return this.http.get<{ data: BiometricStatus }>(this.base(gym) + '/status').pipe(map(r => r.data)); }
++  action<T>(gym: string, method: 'POST' | 'PUT', route: string, body: unknown = {}) {
++    return this.http.request<{ data: T }>(method, this.base(gym) + route, { body }).pipe(map(r => r.data));
++  }
++}
+diff --git a/src/app/views/biometric/biometric.component.html b/src/app/views/biometric/biometric.component.html
+new file mode 100644
+index 0000000..c8f9d44
+--- /dev/null
++++ b/src/app/views/biometric/biometric.component.html
+@@ -0,0 +1,92 @@
++<div class="biometric-page">
++  <div class="page-heading"><div><h1>Biometrics</h1><p class="text-body-secondary">Connect a local service, verify your device and sync attendance.</p></div>
++    <label class="gym-picker">Gym<select class="form-select" [(ngModel)]="gymId" (ngModelChange)="selectGym()" [disabled]="busy()"><option value="">Select a gym</option>@for (gym of gyms(); track gym._id) {<option [value]="gym._id">{{ gym.name }}</option>}</select></label>
++  </div>
++  @if (error()) { <div role="alert" class="alert alert-danger">{{ error() }}</div> }
++  @if (message()) { <div role="status" class="alert alert-info">{{ message() }}</div> }
++  @if (loading()) { <p role="status">Loading connector status…</p> }
++  @if (!gymId) { <div class="card"><div class="card-body">Select one gym to set up or manage its biometric connector.</div></div> }
++  @if (state(); as status) {
++    <div class="alert alert-warning">Development framework: the simulator is available for testing. Physical device models and door-access enforcement await hardware validation.</div>
++    <section class="card mb-4" aria-labelledby="setup-title"><div class="card-body">
++      <h2 id="setup-title">Set up a connector</h2>
++      <ol class="setup-steps">
++        <li><h3>Install on the gym computer</h3><p>The Windows service starts at boot. Keep this computer awake and connected to the gym LAN and internet.</p>
++          @if (status.download; as download) { <a class="btn btn-outline-primary" [href]="download.url" rel="noopener">Download Windows installer</a><p class="small text-break mt-2">SHA-256: {{ download.sha256 }}</p> }
++          @else { <p class="text-body-secondary">A verified Windows installer has not been published for this environment.</p> }
++        </li>
++        <li><h3>Pair with this gym</h3><p>Enter the code in the local Zenvore Connector Setup utility.</p>
++          <button class="btn btn-primary" type="button" [disabled]="busy() || !canManage()" (click)="pair()">Generate pairing code</button>
++          @if (activePairing(); as pair) { <div role="status" class="pair-code"><code>{{ pair.code }}</code><span>Expires {{ pair.expiresAt | date:'shortTime' }}</span></div> }
++        </li>
++        <li><h3>Select and verify the device</h3><p>Discover supported devices or configure an endpoint below. Test the connection, then run the initial attendance sync.</p></li>
++      </ol>
++    </div></section>
++    <section class="card mb-4" aria-labelledby="connectors-title"><div class="card-body">
++      <h2 id="connectors-title">Connectors</h2>
++      @if (!status.connectors.length) { <p>No connector has paired with this gym.</p> }
++      @for (connector of status.connectors; track connector._id) {
++        <div class="connector-row"><div><strong>{{ connector.revokedAt ? 'Revoked' : connector.online ? 'Connected to Zenvore' : 'Offline — cause unknown remotely' }}</strong>
++          <p class="small text-body-secondary mb-1">{{ connector._id }} · v{{ connector.appVersion }} · Last heartbeat: {{ connector.lastHeartbeat ? (connector.lastHeartbeat | date:'medium') : 'Never' }}</p>
++          <p class="small mb-1">Last device contact: {{ connector.health?.lastDeviceCommunication ? (connector.health?.lastDeviceCommunication | date:'medium') : 'Never' }} · Last fetch: {{ connector.health?.lastAttendanceFetch ? (connector.health?.lastAttendanceFetch | date:'medium') : 'Never' }}</p>
++          <p class="small mb-1">Last upload: {{ connector.health?.lastAcknowledgedUpload ? (connector.health?.lastAcknowledgedUpload | date:'medium') : 'Never' }} · Pending events: {{ connector.health?.pendingCount ?? 0 }} · {{ connector.health?.operation || 'idle' }}</p>
++          @if (connector.health?.errorCode) { <p class="text-danger small">{{ connector.health?.errorCode }}</p> }
++        </div>@if (!connector.revokedAt && canRevoke()) { <button type="button" class="btn btn-outline-danger" [disabled]="busy()" (click)="revoke(connector)">Revoke</button> }</div>
++      }
++      <p class="small text-body-secondary mb-0">Offline after {{ status.offlineAfterSeconds }} seconds without a heartbeat. No new scans alone never marks a device offline.</p>
++    </div></section>
++    @if (canManage()) {
++      <section class="card mb-4" aria-labelledby="assignment-title"><div class="card-body">
++        <h2 id="assignment-title">{{ editingDeviceId ? 'Update device endpoint or replace a revoked connector' : 'Discover and assign a device' }}</h2>
++        <p class="text-body-secondary">The simulator uses a local fixture at 127.0.0.1. Real adapter protocols and device credentials will be added after validation.</p>
++        <form (ngSubmit)="editingDeviceId ? updateDevice() : saveDevice()" class="configuration-form">
++          <label>Connector<select class="form-select" name="connector" [(ngModel)]="connectorId" required><option value="">Select a connector</option>@for (connector of status.connectors; track connector._id) { @if (!connector.revokedAt) {<option [value]="connector._id">{{ connector._id }} {{ connector.online ? '(online)' : '(offline)' }}</option>} }</select></label>
++          <div class="align-end"><button type="button" class="btn btn-outline-primary" [disabled]="busy() || !connectorId" (click)="discover()">Discover devices</button></div>
++          <label>Adapter<input class="form-control" value="Development simulator" readonly></label>
++          <label>Device IP<input class="form-control" name="ip" [(ngModel)]="ip" required></label>
++          <label>Port<input class="form-control" name="port" type="number" [(ngModel)]="port" min="1" max="65535" required></label>
++          <label>Device timezone<input class="form-control" name="timezone" [(ngModel)]="timezone" [readonly]="!!editingDeviceId" required></label>
++          <label>Import history from (ISO date and timezone)<input class="form-control" name="history" [(ngModel)]="historySince" [readonly]="!!editingDeviceId" required></label>
++          <div class="align-end"><button class="btn btn-primary" type="submit" [disabled]="busy() || !connectorId">{{ editingDeviceId ? 'Save configuration' : 'Confirm device assignment' }}</button></div>
++        </form>
++        @if (candidates().length) { <h3 class="mt-3">Discovered candidates</h3><p>Select the intended device, then confirm its assignment.</p><div class="candidate-list">@for (candidate of candidates(); track $index) { <button type="button" class="btn btn-outline-secondary" [disabled]="busy()" (click)="selectCandidate(candidate)">{{ candidate.identity }} · {{ candidate.ip }}:{{ candidate.port }}</button> }</div> }
++      </div></section>
++    }
++    <section class="card mb-4" aria-labelledby="devices-title"><div class="card-body">
++      <h2 id="devices-title">Devices</h2>
++      @if (!status.devices.length) { <p>No devices assigned. Use discovery or manual configuration.</p> }
++      @for (device of status.devices; track device._id) {
++        <div class="device-row"><div><h3>{{ device.identity || 'Unverified device' }}</h3><p>{{ device.ip }}:{{ device.port }} · {{ device.timezone }}</p>
++          <p><strong>Connector:</strong> {{ connectorOnline(device) ? 'Online' : 'Offline' }} · <strong>Device:</strong> {{ !connectorOnline(device) ? 'Unknown while connector is offline' : device.report?.reachable ? 'Connected' : 'Unreachable or not tested' }}</p>
++          <p class="small">Attendance: {{ device.capabilities.attendance ? 'Supported' : 'Unverified / unsupported' }} · Access: {{ device.capabilities.access ? 'Supported' : 'Unsupported' }} · Local expiry: {{ device.capabilities.expiry ? 'Supported' : 'Unsupported' }}</p>
++          @for (checkpoint of status.checkpoints; track $index) { @if (checkpoint.deviceId === device._id) {<p class="small">Attendance upload committed {{ checkpoint.acknowledgedAt | date:'medium' }}. A fetch with zero scans is successful.</p>@if (checkpoint.dataGap) {<p class="text-danger">Attendance history gap detected. Retained records were synced; full recovery is unavailable.</p>} } }
++          @if (device.report?.errorCode) { <p class="text-danger">{{ device.report?.errorCode }}</p> }
++        </div><div class="device-actions">
++          <button type="button" class="btn btn-outline-primary" [disabled]="busy() || !canManage() || !connectorOnline(device)" (click)="queue('/devices/' + device._id + '/test')">Test connection</button>
++          <button type="button" class="btn btn-primary" [disabled]="busy() || !canManage() || !connectorOnline(device) || !device.capabilities.attendance" (click)="queue('/devices/' + device._id + '/sync')">Sync now</button>
++          @if (canManage()) { <button type="button" class="btn btn-outline-secondary" [disabled]="busy()" (click)="editDevice(device)">Configure</button> }
++        </div></div>
++      }
++    </div></section>
++    <section class="card mb-4" aria-labelledby="members-title"><div class="card-body">
++      <h2 id="members-title">Member mapping and access</h2><p>{{ status.pendingAccess }} access changes await device confirmation. Cloud changes cannot take immediate effect while the connector is offline.</p>
++      @if (status.unresolved.length) {<h3>Unresolved device users</h3><ul>@for (user of status.unresolved; track $index) {<li>{{ deviceName(user._id.deviceId) }} · Device user {{ user._id.deviceUserId }} · {{ user.count }} events</li>}</ul>}
++      @if (canMap()) {
++        <div class="configuration-form">
++          <label>Device<select class="form-select" [(ngModel)]="deviceId" (ngModelChange)="selectDevice()"><option value="">Select device</option>@for (device of status.devices; track device._id) {<option [value]="device._id">{{ device.identity || device.ip }}</option>}</select></label>
++          <label>Device user ID<input class="form-control" [(ngModel)]="deviceUserId"></label>
++          <label>Find Zenvore member<input class="form-control" [(ngModel)]="memberSearch" (keydown.enter)="searchMembers()"></label>
++          <div class="align-end"><button type="button" class="btn btn-outline-primary" [disabled]="busy()" (click)="searchMembers()">Find members</button></div>
++          <label>Member<select class="form-select" [(ngModel)]="memberId"><option value="">Select a member</option>@for (member of members(); track member._id) {<option [value]="member._id">{{ member.profile.fullName || member.memberCode }} · {{ member.memberCode }}</option>}</select></label>
++          <div class="align-end"><button type="button" class="btn btn-primary" [disabled]="busy() || !deviceId || !memberId || !deviceUserId" (click)="map()">Save mapping</button></div>
++          <label>Access expiry (optional)<input class="form-control" type="datetime-local" [(ngModel)]="accessExpiry" [disabled]="!selectedDevice()?.capabilities?.expiry"></label>
++          <div class="device-actions align-end"><button type="button" class="btn btn-outline-primary" [disabled]="busy() || !memberId || !selectedDevice()?.capabilities?.access" (click)="setAccess(true)">Enable access</button><button type="button" class="btn btn-outline-danger" [disabled]="busy() || !memberId || !selectedDevice()?.capabilities?.access" (click)="setAccess(false)">Disable access</button></div>
++        </div>
++        @if (!selectedDevice()?.capabilities?.access) {<p class="small text-body-secondary mt-2">Select a verified device with access support to change member access.</p>}
++      }
++      @for (access of status.accessStates; track $index) {<p class="small">{{ deviceName(access.deviceId) }} · Member {{ access.memberId }} · Desired {{ access.enabled ? 'enabled' : 'disabled' }} · Version {{ access.version }} · {{ access.confirmedVersion === access.version ? 'Confirmed on device' : 'Pending device confirmation' }}</p>}
++    </div></section>
++    <section class="card mb-4" aria-labelledby="commands-title"><div class="card-body"><h2 id="commands-title">Recent commands</h2><div class="table-responsive"><table class="table"><thead><tr><th scope="col">Requested</th><th scope="col">Action</th><th scope="col">Status</th><th scope="col">Result</th></tr></thead><tbody>@for (command of status.commands; track command._id) {<tr><td>{{ command.createdAt | date:'short' }}</td><td>{{ command.type }}</td><td>{{ command.status }}</td><td>{{ command.result?.errorCode || (command.result?.count != null ? command.result?.count + ' events synced' : '—') }}</td></tr>}</tbody></table></div></div></section>
++    @if (canManage()) {<section class="card" aria-labelledby="support-title"><div class="card-body"><h2 id="support-title">Need help?</h2><p>If no supported device is found, check its settings or request support.</p><label class="form-check"><input class="form-check-input" type="checkbox" [(ngModel)]="supportConsent"><span class="form-check-label">Include connector versions, health times and sanitized error codes in a support request. Credentials and member details are excluded.</span></label><button type="button" class="btn btn-outline-primary mt-3" [disabled]="busy() || !supportConsent" (click)="support()">Submit support request</button></div></section>}
++  }
++</div>
+diff --git a/src/app/views/biometric/biometric.component.scss b/src/app/views/biometric/biometric.component.scss
+new file mode 100644
+index 0000000..e42dd4c
+--- /dev/null
++++ b/src/app/views/biometric/biometric.component.scss
+@@ -0,0 +1,18 @@
++:host { display: block; }
++.biometric-page { max-width: 1320px; margin: 0 auto; }
++.page-heading, .connector-row, .device-row { display: flex; justify-content: space-between; gap: 1.5rem; align-items: flex-start; }
++.page-heading { margin-bottom: 1.5rem; }
++h1 { font-size: 1.75rem; } h2 { font-size: 1.2rem; margin-bottom: 1rem; } h3 { font-size: 1rem; }
++.gym-picker { min-width: 220px; }
++.setup-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2rem; padding-left: 1.5rem; }
++.setup-steps li { padding-left: .5rem; }
++.configuration-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
++label { display: block; font-weight: 500; } label .form-control, label .form-select { margin-top: .35rem; }
++.align-end { align-self: end; }
++.connector-row, .device-row { border-bottom: 1px solid var(--cui-border-color); padding: 1rem 0; }
++.connector-row:last-of-type, .device-row:last-of-type { margin-bottom: 1rem; }
++.device-actions, .candidate-list { display: flex; flex-wrap: wrap; gap: .5rem; }
++.device-actions { max-width: 330px; }
++.pair-code { display: flex; flex-direction: column; gap: .35rem; margin-top: 1rem; }
++.pair-code code { font-size: 1.6rem; letter-spacing: .12em; } .pair-code span { font-size: .85rem; }
++@media (max-width: 850px) { .setup-steps, .configuration-form { grid-template-columns: 1fr; } .page-heading, .device-row, .connector-row { flex-direction: column; } .gym-picker { width: 100%; } }
+diff --git a/src/app/views/biometric/biometric.component.spec.ts b/src/app/views/biometric/biometric.component.spec.ts
+new file mode 100644
+index 0000000..028a281
+--- /dev/null
++++ b/src/app/views/biometric/biometric.component.spec.ts
+@@ -0,0 +1,78 @@
++import { ComponentFixture, fakeAsync, TestBed, tick, discardPeriodicTasks } from '@angular/core/testing';
++import { of, Subject, throwError } from 'rxjs';
++import { BiometricComponent } from './biometric.component';
++import { BiometricService, BiometricStatus } from '../../services/biometric.service';
++import { GymsService } from '../../services/gyms.service';
++import { MembersService } from '../../services/members.service';
++import { PermissionsService } from '../../services/permissions.service';
++
++const status = (): BiometricStatus => ({ connectors: [{ _id: 'connector', online: true, appVersion: '0.1.0' }],
++  devices: [{ _id: 'device', connectorId: 'connector', adapter: 'simulator', ip: '127.0.0.1', port: 4370,
++    timezone: 'Asia/Kolkata', historySince: '2026-10-18T00:00:00.000Z', capabilities: { attendance: false, access: false, expiry: false }, report: { reachable: false } }],
++  commands: [], unresolved: [], checkpoints: [], pendingAccess: 0, accessStates: [], offlineAfterSeconds: 180, download: null });
++
++describe('BiometricComponent', () => {
++  let fixture: ComponentFixture<BiometricComponent>, component: BiometricComponent;
++  let api: jasmine.SpyObj<BiometricService>;
++  beforeEach(async () => {
++    api = jasmine.createSpyObj('BiometricService', ['status', 'action']);
++    api.status.and.returnValue(of(status()));
++    api.action.and.returnValue(of({ commandId: 'queued' }));
++    await TestBed.configureTestingModule({ imports: [BiometricComponent], providers: [
++      { provide: BiometricService, useValue: api },
++      { provide: GymsService, useValue: { getAllGyms: () => of({ data: [] }) } },
++      { provide: MembersService, useValue: { searchMembers: () => of({ data: [] }) } },
++      { provide: PermissionsService, useValue: { hasPermission: () => true, isGymOwner: () => true, isSuperAdmin: () => false } },
++    ] }).compileComponents();
++    fixture = TestBed.createComponent(BiometricComponent); component = fixture.componentInstance;
++  });
++  afterEach(() => fixture.destroy());
++  function start() { fixture.detectChanges(); component.gymId = 'gym'; component.selectGym(); tick(0); fixture.detectChanges(); }
++
++  it('does not mark a device connected because its connector authenticated', fakeAsync(() => {
++    start();
++    expect(fixture.nativeElement.textContent).toContain('Connected to Zenvore');
++    expect(fixture.nativeElement.textContent).toContain('Unreachable or not tested');
++    const sync = [...fixture.nativeElement.querySelectorAll('button')].find((b: any) => b.textContent.trim() === 'Sync now') as HTMLButtonElement;
++    expect(sync.disabled).toBeTrue();
++    discardPeriodicTasks();
++  }));
++  it('shows a committed zero-event sync independently of device access capability', fakeAsync(() => {
++    const s = status(); s.checkpoints = [{ deviceId: 'device', acknowledgedAt: new Date().toISOString(), dataGap: false }];
++    s.commands = [{ _id: 'command', connectorId: 'connector', type: 'SYNC_ATTENDANCE', status: 'succeeded', createdAt: new Date().toISOString(), result: { count: 0 } }];
++    api.status.and.returnValue(of(s)); start();
++    expect(fixture.nativeElement.textContent).toContain('0 events synced');
++    expect(fixture.nativeElement.textContent).toContain('A fetch with zero scans is successful');
++    const enable = [...fixture.nativeElement.querySelectorAll('button')].find((b: any) => b.textContent.trim() === 'Enable access') as HTMLButtonElement;
++    expect(enable.disabled).toBeTrue(); discardPeriodicTasks();
++  }));
++  it('cancels old-gym polling results and clears pairing information on gym change', fakeAsync(() => {
++    const old = new Subject<BiometricStatus>(); api.status.and.returnValue(old); start();
++    component.pairing.set({ code: 'ABCDEF123456', expiresAt: new Date(Date.now() + 300000).toISOString() });
++    const newer = status(); newer.pendingAccess = 7;
++    api.status.and.returnValue(of(newer)); component.gymId = 'new'; component.selectGym(); tick(0);
++    old.next(status());
++    expect(component.state()?.pendingAccess).toBe(7); expect(component.pairing()).toBeNull(); discardPeriodicTasks();
++  }));
++  it('hides stale health information when status cannot be refreshed', fakeAsync(() => {
++    start(); api.status.and.returnValue(throwError(() => new Error('network'))); tick(5000); fixture.detectChanges();
++    expect(component.state()).toBeNull(); expect(fixture.nativeElement.textContent).toContain('Status unavailable'); discardPeriodicTasks();
++  }));
++  it('requires explicit support consent and never infers device success from command enqueue', fakeAsync(() => {
++    start(); component.queue('/devices/device/sync'); tick(0); fixture.detectChanges();
++    expect(component.message()).toContain('Queued command');
++    const support = [...fixture.nativeElement.querySelectorAll('button')].find((b: any) => b.textContent.trim() === 'Submit support request') as HTMLButtonElement;
++    expect(support.disabled).toBeTrue(); discardPeriodicTasks();
++  }));
++  it('expires pairing codes without saving them to browser storage', fakeAsync(() => {
++    start(); const storage = spyOn(localStorage, 'setItem');
++    api.action.and.returnValue(of({ code: 'ABCDEF123456', expiresAt: new Date(Date.now() + 1000).toISOString() }));
++    component.pair(); expect(component.activePairing()?.code).toBe('ABCDEF123456');
++    tick(2000); expect(component.activePairing()).toBeNull(); expect(storage).not.toHaveBeenCalled(); discardPeriodicTasks();
++  }));
++  it('shows device reachability as unknown when connector goes offline', fakeAsync(() => {
++    const s = status(); s.connectors[0].online = false; s.devices[0].report = { reachable: true };
++    api.status.and.returnValue(of(s)); start();
++    expect(fixture.nativeElement.textContent).toContain('Unknown while connector is offline'); discardPeriodicTasks();
++  }));
++});
+diff --git a/src/app/views/biometric/biometric.component.ts b/src/app/views/biometric/biometric.component.ts
+new file mode 100644
+index 0000000..bc9cc07
+--- /dev/null
++++ b/src/app/views/biometric/biometric.component.ts
+@@ -0,0 +1,128 @@
++import { CommonModule } from '@angular/common';
++import { Component, computed, DestroyRef, inject, OnInit, signal } from '@angular/core';
++import { FormsModule } from '@angular/forms';
++import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
++import { catchError, EMPTY, exhaustMap, finalize, Subject, switchMap, timer } from 'rxjs';
++import { BiometricConnector, BiometricDevice, BiometricService, BiometricStatus, DiscoveryCandidate } from '../../services/biometric.service';
++import { Gym, GymsService } from '../../services/gyms.service';
++import { Member, MembersService } from '../../services/members.service';
++import { PermissionsService } from '../../services/permissions.service';
++
++@Component({
++  selector: 'app-biometric', standalone: true, imports: [CommonModule, FormsModule],
++  templateUrl: './biometric.component.html', styleUrl: './biometric.component.scss',
++})
++export class BiometricComponent implements OnInit {
++  private readonly api = inject(BiometricService);
++  private readonly gymsApi = inject(GymsService);
++  private readonly membersApi = inject(MembersService);
++  private readonly destroy = inject(DestroyRef);
++  readonly permissions = inject(PermissionsService);
++  readonly gyms = signal<Gym[]>([]);
++  readonly state = signal<BiometricStatus | null>(null);
++  readonly error = signal('');
++  readonly message = signal('');
++  readonly busy = signal(false);
++  readonly loading = signal(false);
++  readonly pairing = signal<{ code: string; expiresAt: string } | null>(null);
++  readonly now = signal(Date.now());
++  readonly members = signal<Member[]>([]);
++  readonly gymChanges = new Subject<string>();
++  gymId = '';
++  connectorId = '';
++  deviceId = '';
++  editingDeviceId = '';
++  expectedIdentity = '';
++  ip = '127.0.0.1';
++  port = 4370;
++  timezone = 'Asia/Kolkata';
++  historySince = new Date(Date.now() - 86400000).toISOString();
++  deviceUserId = '';
++  memberId = '';
++  memberSearch = '';
++  accessExpiry = '';
++  supportConsent = false;
++  readonly canManage = computed(() => this.permissions.hasPermission('attendance', 'update'));
++  readonly canMap = computed(() => this.canManage() && this.permissions.hasPermission('members', 'update'));
++  readonly canRevoke = computed(() => this.permissions.isGymOwner() || this.permissions.isSuperAdmin());
++  readonly activePairing = computed(() => { const p = this.pairing(); return p && new Date(p.expiresAt).getTime() > this.now() ? p : null; });
++  readonly selectedDevice = computed(() => this.state()?.devices.find(d => d._id === this.selectedDeviceId()) ?? null);
++  readonly selectedDeviceId = signal('');
++  readonly candidates = computed(() => this.state()?.commands.filter(c => c.type === 'DISCOVER_DEVICES' && c.status === 'succeeded')
++    .flatMap(c => (c.result?.candidates ?? []).map(candidate => ({ ...candidate, connectorId: c.connectorId }))) ?? []);
++
++  ngOnInit() {
++    this.gymsApi.getAllGyms(1, 100).pipe(takeUntilDestroyed(this.destroy)).subscribe({
++      next: r => { this.gyms.set(r.data.filter(g => g.isActive)); if (this.gyms().length === 1) { this.gymId = this.gyms()[0]._id; this.selectGym(); } },
++      error: () => this.error.set('Could not load gyms.'),
++    });
++    this.gymChanges.pipe(switchMap(gym => gym ? timer(0, 5000).pipe(exhaustMap(() => this.api.status(gym).pipe(
++      catchError(() => { this.state.set(null); this.loading.set(false); this.error.set('Status unavailable. Check your connection and permissions.'); return EMPTY; }),
++    ))) : EMPTY), takeUntilDestroyed(this.destroy)).subscribe(status => { this.state.set(status); this.loading.set(false); if (this.error().startsWith('Status unavailable')) this.error.set(''); });
++    timer(0, 1000).pipe(takeUntilDestroyed(this.destroy)).subscribe(() => this.now.set(Date.now()));
++  }
++  selectGym() {
++    this.state.set(null); this.pairing.set(null); this.connectorId = ''; this.deviceId = ''; this.selectedDeviceId.set('');
++    this.editingDeviceId = ''; this.expectedIdentity = ''; this.memberId = '';  this.members.set([]); this.error.set(''); this.message.set(''); this.supportConsent = false;
++    this.loading.set(!!this.gymId); this.gymChanges.next(this.gymId);
++  }
++  private action<T>(method: 'POST' | 'PUT', route: string, body: unknown, done: (result: T) => void) {
++    if (!this.gymId || this.busy()) return;
++    this.error.set(''); this.message.set(''); this.busy.set(true);
++    this.api.action<T>(this.gymId, method, route, body).pipe(finalize(() => this.busy.set(false)), takeUntilDestroyed(this.destroy)).subscribe({
++      next: result => { done(result); this.gymChanges.next(this.gymId); },
++      error: e => this.error.set(typeof e.error?.message === 'string' ? e.error.message : 'Action failed. Check configuration and permissions.'),
++    });
++  }
++  pair() { this.action<{ code: string; expiresAt: string }>('POST', '/pairing-codes', {}, code => this.pairing.set(code)); }
++  discover() { if (this.connectorId) this.queue('/connectors/' + this.connectorId + '/discover'); }
++  queue(route: string) { this.action<{ commandId: string }>('POST', route, {}, r => this.message.set('Queued command ' + r.commandId + '. Device success appears in command results.')); }
++  selectCandidate(candidate: DiscoveryCandidate & { connectorId: string }) {
++    this.connectorId = candidate.connectorId; this.ip = candidate.ip; this.port = candidate.port;
++    this.editingDeviceId = ''; this.expectedIdentity = candidate.identity; this.message.set('Selected ' + candidate.identity + '. Confirm the assignment below.');
++  }
++  saveDevice() {
++    const date = new Date(this.historySince);
++    if (!Number.isFinite(date.getTime()) || !this.connectorId) { this.error.set('Select a connector and a valid history start.'); return; }
++    this.action('POST', '/devices', { connectorId: this.connectorId, adapter: 'simulator', ip: this.ip, port: this.port,
++      timezone: this.timezone, historySince: date.toISOString(), ...(this.expectedIdentity ? { expectedIdentity: this.expectedIdentity } : {}) }, () => this.message.set('Device assigned. Test its connection, then run the initial sync.'));
++  }
++  editDevice(device: BiometricDevice) {
++    this.expectedIdentity = ''; this.editingDeviceId = device._id; this.connectorId = device.connectorId; this.ip = device.ip; this.port = device.port;
++    this.timezone = device.timezone; this.historySince = device.historySince;
++  }
++  updateDevice() {
++    this.action('PUT', '/devices/' + this.editingDeviceId, { connectorId: this.connectorId, adapter: 'simulator', ip: this.ip,
++      port: this.port, timezone: this.timezone, historySince: this.historySince }, () => { this.editingDeviceId = ''; this.message.set('Device configuration updated. Test the connection again.'); });
++  }
++  selectDevice() { this.selectedDeviceId.set(this.deviceId); }
++  searchMembers() {
++    if (!this.gymId || !this.permissions.hasPermission('members', 'read')) return;
++    this.membersApi.searchMembers(this.memberSearch, 1, 25, this.gymId).pipe(takeUntilDestroyed(this.destroy)).subscribe({
++      next: r => this.members.set(r.data), error: () => this.error.set('Could not load members.'),
++    });
++  }
++  map() {
++    if (!this.deviceId || !this.memberId || !this.deviceUserId.trim()) return;
++    this.action<{ more: boolean }>('PUT', '/devices/' + this.deviceId + '/mappings', { memberId: this.memberId, deviceUserId: this.deviceUserId.trim() },
++      result => this.message.set(result.more ? 'Mapping saved. Repeat to resolve the next page of historical events.' : 'Member mapped and unresolved attendance reconciled.'));
++  }
++  setAccess(enabled: boolean) {
++    if (!this.deviceId || !this.memberId) return;
++    const body: { enabled: boolean; expiresAt?: string } = { enabled };
++    if (this.accessExpiry) {
++      const date = new Date(this.accessExpiry);
++      if (!Number.isFinite(date.getTime())) { this.error.set('Enter a valid access expiry.'); return; }
++      body.expiresAt = date.toISOString();
++    }
++    this.action<{ commandId: string }>('PUT', '/devices/' + this.deviceId + '/members/' + this.memberId + '/access', body,
++      result => this.message.set('Desired access saved. Await device confirmation for command ' + result.commandId + '.'));
++  }
++  revoke(connector: BiometricConnector) {
++    if (!confirm('Revoke this connector? Its devices stop syncing until you pair a replacement and reassign them.')) return;
++    this.action('POST', '/connectors/' + connector._id + '/revoke', {}, () => this.message.set('Connector revoked. Generate a fresh pairing code to pair a replacement.'));
++  }
++  support() { this.action<{ requestId: string }>('POST', '/support-requests', { consent: this.supportConsent }, result => { this.supportConsent = false; this.message.set('Support request saved: ' + result.requestId); }); }
++  connectorOnline(device: BiometricDevice) { return !!this.state()?.connectors.find(c => c._id === device.connectorId)?.online; }
++  deviceName(id: string) { const device = this.state()?.devices.find(d => d._id === id); return device?.identity || device?.ip || id; }
++}

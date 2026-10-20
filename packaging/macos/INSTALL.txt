@@ -1,0 +1,18 @@
+Zenvore Biometric Connector for macOS
+
+1. Drag Zenvore Connector.app to Applications, then eject this disk.
+2. Open the app from Applications.
+3. Generate a five-minute pairing code in your gym's Zenvore Biometrics page.
+4. Enter the code in the app, then select your Ethernet interface or enter the device IP and port.
+5. Click Verify and connect. Ready means identity, users and attendance data were read successfully.
+6. Click Enable background sync. It continues after closing setup and starts when you log in.
+
+Keep this Mac awake, logged in and connected to the device network. macOS may request Local Network access and access to this app's own Keychain items. Background sync cannot run while the Mac is asleep or the user is logged out. Disable background sync in the app before moving or deleting it.
+
+This build supports Identix / ZK-compatible TCP devices only where the implemented protocol matches the model and firmware. Windows-only vendor SDKs are not bundled.
+
+Local builds are ad-hoc signed and not Apple-notarized. Only open a local build you trust via Finder's Open action / Privacy & Security > Open Anyway if macOS blocks it. Public releases should use Developer ID signing and Apple notarization.
+
+Credentials are stored in the logged-in user's Keychain; local attendance recovery state is in ~/Library/Application Support/Zenvore/BiometricConnector. Deleting the app does not remove either. Revoke the installation in Zenvore before retiring this Mac.
+
+Support: support@thezenvore.com. No email is sent automatically.

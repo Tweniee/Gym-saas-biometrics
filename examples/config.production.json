@@ -1,0 +1,7 @@
+{
+  "api_url": "https://api.example.invalid/api/v1",
+  "development": false,
+  "heartbeat_seconds": 60,
+  "sync_seconds": 60,
+  "timeout_seconds": 15
+}

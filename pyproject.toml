@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zenvore-biometric-connector"
+version = "0.1.0"
+description = "Durable local bridge between Zenvore and verified biometric adapters"
+requires-python = ">=3.11"
+dependencies = ["psutil>=6,<8", "tzdata>=2025.1", "pywin32>=308; sys_platform == 'win32'"]
+
+[project.optional-dependencies]
+build = ["pyinstaller>=6.11,<7"]
+
+[project.scripts]
+zenvore-connector = "zenvore_connector.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

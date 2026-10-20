@@ -1,0 +1,28 @@
+name: Build connector for Windows
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: HTTPS API base URL including /api/v1
+        required: true
+        default: https://api.zenvore.com/api/v1
+permissions:
+  contents: read
+jobs:
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: x64
+      - name: Build and test installer
+        env:
+          CONNECTOR_BUILD_API_URL: ${{ inputs.api_url }}
+        shell: pwsh
+        run: ./packaging/windows/build.ps1 -ApiUrl $env:CONNECTOR_BUILD_API_URL
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zenvore-connector-windows-x64
+          path: dist/installer/*.exe

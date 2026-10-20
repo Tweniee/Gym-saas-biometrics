@@ -1,0 +1,1259 @@
+diff --git a/src/analytics/analytics.service.ts b/src/analytics/analytics.service.ts
+index 3209fc6..5303d6a 100644
+--- a/src/analytics/analytics.service.ts
++++ b/src/analytics/analytics.service.ts
+@@ -1,3 +1,4 @@
++import { biometricAttendanceFilter } from '../attendance/biometric-attendance-scope';
+ import { CONVERSION_POLICY, ConversionRecord, evaluateLeadConversion } from "./lead-conversion";
+ import { LeadConversionQueryDto } from "./dto/lead-conversion-query.dto";
+ import { BadRequestException, Injectable } from "@nestjs/common";
+@@ -430,6 +431,7 @@ export class AnalyticsService {
+   /** Stages scoping attendance, which links to a gym only through its user. */
+   private viaAttendanceUser(scope: AnalyticsScope): PipelineStage[] {
+     return [
++      { $match: biometricAttendanceFilter(scope.gymIds) },
+       {
+         $lookup: {
+           from: "usergymmappings",
+diff --git a/src/app.module.ts b/src/app.module.ts
+index 1eba9fc..c5ebdda 100644
+--- a/src/app.module.ts
++++ b/src/app.module.ts
+@@ -1,3 +1,4 @@
++import { BiometricModule } from './biometric/biometric.module';
+ import { Logger, Module } from "@nestjs/common";
+ import { APP_GUARD } from "@nestjs/core";
+ import { ScheduleModule } from "@nestjs/schedule";
+@@ -196,6 +197,7 @@ const IS_SCHEDULER = APP_ROLE === 'scheduler' || IS_ALL;
+     AuthModule,
+     MembersModule,
+     AttendanceModule,
++    BiometricModule,
+     BodyPartsModule,
+     ExercisesModule,
+     PermissionsModule,
+diff --git a/src/attendance/attendance.service.ts b/src/attendance/attendance.service.ts
+index f1677ff..988f624 100644
+--- a/src/attendance/attendance.service.ts
++++ b/src/attendance/attendance.service.ts
+@@ -1,3 +1,4 @@
++import { biometricAttendanceFilter } from './biometric-attendance-scope';
+ import {
+   Injectable,
+   BadRequestException,
+@@ -71,6 +72,7 @@ export class AttendanceService {
+       : { tenantId: new Types.ObjectId(tenantId as string) };
+ 
+     return [
++      { $match: biometricAttendanceFilter(gymId ? [new Types.ObjectId(gymId)] : undefined, tenantId ? new Types.ObjectId(tenantId) : undefined) },
+       {
+         $lookup: {
+           from: "usergymmappings",
+diff --git a/src/attendance/schemas/attendance.schema.ts b/src/attendance/schemas/attendance.schema.ts
+index 54d0de3..8853c91 100644
+--- a/src/attendance/schemas/attendance.schema.ts
++++ b/src/attendance/schemas/attendance.schema.ts
+@@ -60,6 +60,12 @@ export class Attendance extends Document {
+   @Prop()
+   localDate?: string;
+ 
++  @Prop()
++  biometricEventKey?: string;
++
++  @Prop({ type: Types.ObjectId, ref: "Tenant" })
++  tenantId?: Types.ObjectId;
++
+   @Prop({ default: true })
+   isActive: boolean;
+ }
+@@ -76,3 +82,5 @@ AttendanceSchema.index({ deviceId: 1, localDate: 1 });
+ // user's gym mapping (QR check-ins do not stamp gymId on the document).
+ AttendanceSchema.index({ checkInTime: -1 });
+ AttendanceSchema.index({ userId: 1, checkInTime: -1 });
++
++AttendanceSchema.index({ biometricEventKey: 1 }, { unique: true, partialFilterExpression: { biometricEventKey: { $type: "string" } } });
+diff --git a/src/backend-architecture.spec.ts b/src/backend-architecture.spec.ts
+index beea9e7..24d27ff 100644
+--- a/src/backend-architecture.spec.ts
++++ b/src/backend-architecture.spec.ts
+@@ -1,3 +1,4 @@
++import { ConnectorGuard } from './biometric/connector.guard';
+ import 'reflect-metadata';
+ import * as assert from 'node:assert/strict';
+ import * as fs from 'node:fs';
+@@ -25,6 +26,11 @@ const publicEndpoints = new Set([
+     'AuthController.sendOtp', 'AuthController.resendOtp', 'AuthController.verifyOtp',
+     // Skips user JWT only; requires confidential-client secret and S256 proof.
+     'MarketingSsoController.exchange',
++    // Connector routes bypass human JWT only and use their own live-revocation guard.
++    'ConnectorRegistrationController.pair', 'ConnectorRegistrationController.token',
++    'ConnectorController.rotate', 'ConnectorController.heartbeat', 'ConnectorController.devices',
++    'ConnectorController.report', 'ConnectorController.access', 'ConnectorController.observed',
++    'ConnectorController.commands', 'ConnectorController.ack', 'ConnectorController.result', 'ConnectorController.ingest',
+     'SubscriptionsController.findOneForPayment', 'CouponsController.validate',
+     'LinearWebhookController.handleWebhook',
+     'MarketingAccessController.check', 'MarketingAudienceController.validate',
+@@ -57,6 +63,10 @@ for (const file of controllerFiles) {
+                 assert.equal(isPublic === true, publicEndpoints.has(route), route + ' changed its anonymous access contract');
+                 if (isPublic)
+                     seenPublic.add(route);
++                if (Controller.name === 'ConnectorController') {
++                    const guards = [...(Reflect.getMetadata(GUARDS_METADATA, Controller) ?? []), ...(Reflect.getMetadata(GUARDS_METADATA, handler) ?? [])];
++                    assert.ok(guards.includes(ConnectorGuard), route + ' must authenticate the connector and check revocation');
++                }
+                 const permissions = Reflect.getMetadata(PERMISSIONS_KEY, handler) ?? Reflect.getMetadata(PERMISSIONS_KEY, Controller);
+                 const anyPermissions = Reflect.getMetadata(ANY_PERMISSIONS_KEY, handler) ?? Reflect.getMetadata(ANY_PERMISSIONS_KEY, Controller);
+                 if (permissions?.length || anyPermissions?.length) {
+diff --git a/src/biometric/biometric.controller.ts b/src/biometric/biometric.controller.ts
+new file mode 100644
+index 0000000..4b675cc
+--- /dev/null
++++ b/src/biometric/biometric.controller.ts
+@@ -0,0 +1,66 @@
++import { Body, Controller, Get, Param, Post, Put, Query, Request, UseGuards } from '@nestjs/common';
++import { Throttle } from '@nestjs/throttler';
++import { Public } from '../auth/decorators/public.decorator';
++import { Permissions } from '../auth/decorators/permissions.decorator';
++import { PermissionsGuard } from '../auth/guards/permissions.guard';
++import { AccessDto, AckDto, BatchDto, DeviceDto, HeartbeatDto, MappingDto, ObservedAccessDto, PairDto, ReportDto, ResultDto, SupportDto, TokenDto } from './biometric.dto';
++import { BiometricService } from './biometric.service';
++import { ConnectorGuard } from './connector.guard';
++
++@Controller('connectors')
++export class ConnectorRegistrationController {
++  constructor(private readonly service: BiometricService) {}
++  @Post('pair') @Public() @Throttle({ default: { limit: 5, ttl: 60000 } })
++  pair(@Body() dto: PairDto) { return this.service.pair(dto); }
++  @Post('token') @Public() @Throttle({ default: { limit: 30, ttl: 60000 } })
++  token(@Body() dto: TokenDto) { return this.service.token(dto); }
++}
++
++@Public() @UseGuards(ConnectorGuard)
++@Controller('connectors/me')
++export class ConnectorController {
++  constructor(private readonly service: BiometricService) {}
++  @Post('rotate-credential') rotate(@Request() req) { return this.service.rotate(req.connector); }
++  @Post('heartbeat') heartbeat(@Request() req, @Body() dto: HeartbeatDto) { return this.service.heartbeat(req.connector, dto); }
++  @Get('devices') devices(@Request() req) { return this.service.devices(req.connector); }
++  @Put('devices/:deviceId/report') report(@Request() req, @Param('deviceId') id: string, @Body() dto: ReportDto) { return this.service.report(req.connector, id, dto); }
++  @Get('devices/:deviceId/access-state') access(@Request() req, @Param('deviceId') id: string, @Query('after') after?: string) { return this.service.access(req.connector, id, after); }
++  @Post('devices/:deviceId/access-observed') observed(@Request() req, @Param('deviceId') id: string, @Body() dto: ObservedAccessDto) { return this.service.observed(req.connector, id, dto); }
++  @Get('commands') commands(@Request() req, @Query('waitSeconds') wait?: string) {
++    const seconds = Math.max(0, Math.min(15, Number(wait) || 0));
++    return this.service.commands(req.connector, seconds);
++  }
++  @Post('commands/:commandId/ack') ack(@Request() req, @Param('commandId') id: string, @Body() dto: AckDto) { return this.service.ack(req.connector, id, dto.leaseToken); }
++  @Post('commands/:commandId/result') result(@Request() req, @Param('commandId') id: string, @Body() dto: ResultDto) { return this.service.result(req.connector, id, dto); }
++  @Post('attendance/batches') @Throttle({ default: { limit: 60, ttl: 60000 } })
++  ingest(@Request() req, @Body() dto: BatchDto) { return this.service.ingest(req.connector, dto); }
++}
++
++@UseGuards(PermissionsGuard)
++@Controller('gyms/:gymId/biometric')
++export class BiometricAdminController {
++  constructor(private readonly service: BiometricService) {}
++  private gym(req: any, id: string) { return this.service.gym(req.user, id); }
++  @Get('status') @Permissions('attendance.read')
++  async status(@Request() req, @Param('gymId') gym: string) { return { success: true, data: await this.service.status(await this.gym(req, gym)) }; }
++  @Post('pairing-codes') @Permissions('attendance.update') @Throttle({ default: { limit: 5, ttl: 60000 } })
++  async pair(@Request() req, @Param('gymId') gym: string) { return { success: true, data: await this.service.issuePairing(await this.gym(req, gym), req.user.userId) }; }
++  @Post('devices') @Permissions('attendance.update')
++  async add(@Request() req, @Param('gymId') gym: string, @Body() dto: DeviceDto) { return { success: true, data: await this.service.addDevice(await this.gym(req, gym), req.user.userId, dto) }; }
++  @Put('devices/:deviceId') @Permissions('attendance.update')
++  async update(@Request() req, @Param('gymId') gym: string, @Param('deviceId') id: string, @Body() dto: DeviceDto) { return { success: true, data: await this.service.updateDevice(await this.gym(req, gym), req.user.userId, id, dto) }; }
++  @Post('connectors/:connectorId/discover') @Permissions('attendance.update') @Throttle({ default: { limit: 5, ttl: 60000 } })
++  async discover(@Request() req, @Param('gymId') gym: string, @Param('connectorId') id: string) { return { success: true, data: await this.service.discover(await this.gym(req, gym), req.user.userId, id) }; }
++  @Post('devices/:deviceId/sync') @Permissions('attendance.update') @Throttle({ default: { limit: 10, ttl: 60000 } })
++  async sync(@Request() req, @Param('gymId') gym: string, @Param('deviceId') id: string) { return { success: true, data: await this.service.queue(await this.gym(req, gym), req.user.userId, id, 'SYNC_ATTENDANCE') }; }
++  @Post('devices/:deviceId/test') @Permissions('attendance.update') @Throttle({ default: { limit: 10, ttl: 60000 } })
++  async test(@Request() req, @Param('gymId') gym: string, @Param('deviceId') id: string) { return { success: true, data: await this.service.queue(await this.gym(req, gym), req.user.userId, id, 'TEST_DEVICE_CONNECTION') }; }
++  @Put('devices/:deviceId/mappings') @Permissions('attendance.update', 'members.update')
++  async map(@Request() req, @Param('gymId') gym: string, @Param('deviceId') id: string, @Body() dto: MappingDto) { return { success: true, data: await this.service.map(await this.gym(req, gym), req.user.userId, id, dto) }; }
++  @Put('devices/:deviceId/members/:memberId/access') @Permissions('attendance.update', 'members.update')
++  async access(@Request() req, @Param('gymId') gym: string, @Param('deviceId') id: string, @Param('memberId') member: string, @Body() dto: AccessDto) { return { success: true, data: await this.service.setAccess(await this.gym(req, gym), req.user.userId, id, member, dto) }; }
++  @Post('connectors/:connectorId/revoke') @Permissions('attendance.update')
++  async revoke(@Request() req, @Param('gymId') gym: string, @Param('connectorId') id: string) { return { success: true, data: await this.service.revoke(await this.gym(req, gym), req.user, id) }; }
++  @Post('support-requests') @Permissions('attendance.update') @Throttle({ default: { limit: 3, ttl: 60000 } })
++  async support(@Request() req, @Param('gymId') gym: string, @Body() dto: SupportDto) { return { success: true, data: await this.service.support(await this.gym(req, gym), req.user.userId, dto.consent) }; }
++}
+diff --git a/src/biometric/biometric.dto.ts b/src/biometric/biometric.dto.ts
+new file mode 100644
+index 0000000..44d595c
+--- /dev/null
++++ b/src/biometric/biometric.dto.ts
+@@ -0,0 +1,90 @@
++import { Type } from 'class-transformer';
++import { ArrayMaxSize, ArrayMinSize, IsArray, IsBoolean, IsDateString, IsIn, IsInt, IsIP, IsMongoId, IsOptional, IsString, Matches, Max, MaxLength, Min, ValidateNested } from 'class-validator';
++
++export class PairDto {
++  @IsString() @Matches(/^[A-F0-9]{12}$/) code: string;
++  @IsString() @MaxLength(40) appVersion: string;
++}
++export class TokenDto {
++  @IsMongoId() connectorId: string;
++  @IsString() @Matches(/^[a-f0-9]{64}$/) credential: string;
++}
++export class DeviceDto {
++  @IsOptional() @IsString() @MaxLength(120) expectedIdentity?: string;
++  @IsMongoId() connectorId: string;
++  // Only the simulator has a tested adapter in this release.
++  @IsIn(['simulator']) adapter: string;
++  @IsIP(4) ip: string;
++  @IsInt() @Min(1) @Max(65535) port: number;
++  @IsString() @MaxLength(80) timezone: string;
++  @IsDateString() historySince: string;
++}
++export class HeartbeatDto {
++  @IsString() @MaxLength(40) appVersion: string;
++  @IsInt() @Min(0) @Max(100000) pendingCount: number;
++  @IsOptional() @IsIn(['idle', 'sync', 'command']) operation?: string;
++  @IsOptional() @IsDateString() lastDeviceCommunication?: string;
++  @IsOptional() @IsDateString() lastAttendanceFetch?: string;
++  @IsOptional() @IsDateString() lastAcknowledgedUpload?: string;
++  @IsOptional() @IsIn(['CLOUD_DNS', 'CLOUD_TLS', 'CLOUD_AUTH', 'CLOUD_SERVER', 'CLOUD_NETWORK', 'DEVICE_UNREACHABLE', 'DATA_GAP', 'QUEUE_FULL', 'STORAGE_ERROR', 'IDENTITY_MISMATCH', 'UNSUPPORTED', 'INVALID_DEVICE_DATA', 'INTERNAL_ERROR']) errorCode?: string;
++}
++export class ReportDto {
++  @IsOptional() @IsIP(4) ip?: string;
++  @IsOptional() @IsInt() @Min(1) @Max(65535) port?: number;
++  @IsBoolean() reachable: boolean;
++  @IsOptional() @IsString() @MaxLength(120) identity?: string;
++  @IsBoolean() attendance: boolean;
++  @IsBoolean() access: boolean;
++  @IsBoolean() expiry: boolean;
++  @IsOptional() @IsIn(['DEVICE_UNREACHABLE', 'DATA_GAP', 'IDENTITY_MISMATCH', 'UNSUPPORTED', 'INVALID_DEVICE_DATA']) errorCode?: string;
++}
++export class AckDto {
++  @IsString() @Matches(/^[a-f0-9]{32}$/) leaseToken: string;
++}
++export class ResultDto extends AckDto {
++  @IsIn(['succeeded', 'failed', 'superseded']) status: string;
++  @IsOptional() @IsIn(['DEVICE_UNREACHABLE', 'DATA_GAP', 'QUEUE_FULL', 'STORAGE_ERROR', 'IDENTITY_MISMATCH', 'UNSUPPORTED', 'INVALID_DEVICE_DATA', 'INTERNAL_ERROR']) errorCode?: string;
++  @IsOptional() @IsInt() @Min(0) count?: number;
++  @IsOptional() @IsBoolean() transient?: boolean;
++  @IsOptional() @IsArray() @ArrayMaxSize(32) @ValidateNested({ each: true }) @Type(() => DiscoveryCandidateDto) candidates?: DiscoveryCandidateDto[];
++}
++export class DiscoveryCandidateDto {
++  @IsString() @MaxLength(120) identity: string;
++  @IsIn(['simulator']) adapter: string;
++  @IsIP(4) ip: string;
++  @IsInt() @Min(1) @Max(65535) port: number;
++}
++export class EventDto {
++  @IsString() @Matches(/^[a-f0-9]{64}$/) eventId: string;
++  @IsString() @MaxLength(100) nativeId: string;
++  @IsString() @MaxLength(100) deviceUserId: string;
++  @IsDateString() occurredAt: string;
++  @IsString() @MaxLength(100) rawTimestamp: string;
++  @IsString() @MaxLength(80) timezone: string;
++  @IsIn(['check-in', 'check-out', 'access-granted', 'access-denied', 'unknown']) eventType: string;
++}
++export class BatchDto {
++  @IsMongoId() deviceId: string;
++  @IsString() @MaxLength(100) generation: string;
++  @IsString() @Matches(/^\d{1,16}$/) position: string;
++  @IsBoolean() dataGap: boolean;
++  @IsArray() @ArrayMaxSize(200) @ValidateNested({ each: true }) @Type(() => EventDto) events: EventDto[];
++}
++export class MappingDto {
++  @IsString() @MaxLength(100) deviceUserId: string;
++  @IsMongoId() memberId: string;
++}
++export class AccessDto {
++  @IsBoolean() enabled: boolean;
++  @IsOptional() @IsDateString() expiresAt?: string;
++}
++export class SupportDto {
++  @IsBoolean() consent: boolean;
++}
++
++export class ObservedAccessDto {
++  @IsMongoId() memberId: string;
++  @IsInt() @Min(1) version: number;
++  @IsBoolean() enabled: boolean;
++  @IsOptional() @IsDateString() expiresAt?: string;
++}
+diff --git a/src/biometric/biometric.module.spec.ts b/src/biometric/biometric.module.spec.ts
+new file mode 100644
+index 0000000..ba31671
+--- /dev/null
++++ b/src/biometric/biometric.module.spec.ts
+@@ -0,0 +1,50 @@
++import 'reflect-metadata';
++import { test } from 'node:test';
++import * as assert from 'node:assert/strict';
++import { Global, Module } from '@nestjs/common';
++import { MODULE_METADATA } from '@nestjs/common/constants';
++import { ConfigService } from '@nestjs/config';
++import { NestFactory } from '@nestjs/core';
++import { getConnectionToken } from '@nestjs/mongoose';
++import { AuthModule } from '../auth/auth.module';
++import { PermissionsGuard } from '../auth/guards/permissions.guard';
++import { PlanEntitlementsService } from '../subscriptions/plan-entitlements.service';
++import { BiometricModule } from './biometric.module';
++import { BiometricAdminController } from './biometric.controller';
++
++test('biometric admin controller and PermissionsGuard resolve in the feature module', async () => {
++  // Exercise actual model registrations, controllers and guards without starting MongoDB
++  // or the unrelated login infrastructure brought in by AuthModule.
++  const connection = { models: {}, model: () => ({}) };
++  const dependencies = [
++    { provide: getConnectionToken(), useValue: connection },
++    { provide: ConfigService, useValue: {} },
++    { provide: PlanEntitlementsService, useValue: {} },
++  ];
++  @Global()
++  @Module({ providers: dependencies, exports: dependencies.map(({ provide }) => provide) })
++  class TestDependencies {}
++
++  @Module({
++    imports: Reflect.getMetadata(MODULE_METADATA.IMPORTS, BiometricModule)
++      .filter((imported: unknown) => imported !== AuthModule),
++    controllers: Reflect.getMetadata(MODULE_METADATA.CONTROLLERS, BiometricModule),
++    providers: Reflect.getMetadata(MODULE_METADATA.PROVIDERS, BiometricModule),
++  })
++  class IsolatedBiometricModule {}
++
++  @Module({ imports: [TestDependencies, IsolatedBiometricModule] })
++  class TestApp {}
++
++  const app = await NestFactory.createApplicationContext(TestApp, {
++    logger: false,
++    abortOnError: false,
++  });
++  try {
++    const feature = app.select(IsolatedBiometricModule);
++    assert.ok(feature.get(BiometricAdminController, { strict: true }));
++    assert.ok(feature.get(PermissionsGuard, { strict: true }));
++  } finally {
++    await app.close();
++  }
++});
+diff --git a/src/biometric/biometric.module.ts b/src/biometric/biometric.module.ts
+new file mode 100644
+index 0000000..e252a32
+--- /dev/null
++++ b/src/biometric/biometric.module.ts
+@@ -0,0 +1,26 @@
++import { Module } from '@nestjs/common';
++import { MongooseModule } from '@nestjs/mongoose';
++import { AuthModule } from '../auth/auth.module';
++import { User, UserSchema } from '../users/schemas/user.schema';
++import { Role, RoleSchema } from '../roles/schemas/role.schema';
++import { Permission, PermissionSchema } from '../permissions/schemas/permission.schema';
++import { biometricSchemas } from './biometric.schemas';
++import { BiometricService } from './biometric.service';
++import { ConnectorGuard } from './connector.guard';
++import { BiometricAdminController, ConnectorController, ConnectorRegistrationController } from './biometric.controller';
++
++@Module({
++  imports: [
++    AuthModule,
++    MongooseModule.forFeature([
++      ...Object.entries(biometricSchemas).map(([name, schema]) => ({ name, schema })),
++      // Nest instantiates the admin controller's PermissionsGuard in this module.
++      { name: User.name, schema: UserSchema },
++      { name: Role.name, schema: RoleSchema },
++      { name: Permission.name, schema: PermissionSchema },
++    ]),
++  ],
++  controllers: [BiometricAdminController, ConnectorController, ConnectorRegistrationController],
++  providers: [BiometricService, ConnectorGuard],
++})
++export class BiometricModule {}
+diff --git a/src/biometric/biometric.schemas.ts b/src/biometric/biometric.schemas.ts
+new file mode 100644
+index 0000000..e00343c
+--- /dev/null
++++ b/src/biometric/biometric.schemas.ts
+@@ -0,0 +1,39 @@
++import { Schema } from 'mongoose';
++
++// Registered models make the existing additive seed:indexes migration build
++// every uniqueness constraint. Transactions require a replica set.
++const O = Schema.Types.ObjectId;
++const mixed = Schema.Types.Mixed;
++const schema = (fields: any, collection: string) => new Schema(fields, { collection, timestamps: true });
++export const biometricSchemas = {
++  BiometricPairing: schema({ verifier: String, tenantId: O, gymId: O, createdBy: O, expiresAt: Date, consumedAt: Date, revokedAt: Date }, 'biometricpairings'),
++  BiometricConnector: schema({ tenantId: O, gymId: O, credentialVerifier: String, credentialVersion: Number,
++    previousVerifier: String, previousUntil: Date, revokedAt: Date, appVersion: String, lastHeartbeat: Date, health: mixed }, 'biometricconnectors'),
++  BiometricDevice: schema({ tenantId: O, gymId: O, connectorId: O, adapter: String, ip: String, port: Number,
++    timezone: String, historySince: String, identity: String, capabilities: mixed, report: mixed, generation: String }, 'biometricdevices'),
++  BiometricMapping: schema({ tenantId: O, gymId: O, deviceId: O, deviceUserId: String, memberId: O }, 'biometricmappings'),
++  BiometricAccess: schema({ tenantId: O, gymId: O, deviceId: O, memberId: O, deviceUserId: String,
++    enabled: Boolean, expiresAt: String, version: Number, confirmedVersion: Number }, 'biometricaccess'),
++  BiometricCommand: schema({ tenantId: O, gymId: O, connectorId: O, deviceId: O, type: String, payload: mixed,
++    status: String, attempts: Number, leaseToken: String, leaseUntil: Date, expiresAt: Date, nextAttempt: Date,
++    result: mixed, completedAt: Date, createdBy: O }, 'biometriccommands'),
++  BiometricEvent: schema({ tenantId: O, gymId: O, deviceId: O, eventId: String, generation: String, nativeId: String,
++    deviceUserId: String, memberId: O, occurredAt: Date, rawTimestamp: String, timezone: String, eventType: String,
++    resolvedAt: Date }, 'biometricevents'),
++  BiometricCheckpoint: schema({ tenantId: O, gymId: O, deviceId: O, generation: String, position: String,
++    acknowledgedAt: Date, dataGap: Boolean }, 'biometriccheckpoints'),
++  BiometricSupport: schema({ tenantId: O, gymId: O, createdBy: O, diagnostics: mixed, status: String }, 'biometricsupport'),
++  BiometricAudit: schema({ tenantId: O, gymId: O, actorId: O, action: String, targetId: O }, 'biometricaudits'),
++};
++biometricSchemas.BiometricPairing.index({ verifier: 1 }, { unique: true });
++biometricSchemas.BiometricPairing.index({ expiresAt: 1 }, { expireAfterSeconds: 86400 });
++biometricSchemas.BiometricConnector.index({ gymId: 1, revokedAt: 1 });
++biometricSchemas.BiometricDevice.index({ gymId: 1, identity: 1 }, { unique: true, partialFilterExpression: { identity: { $type: 'string' } } });
++biometricSchemas.BiometricMapping.index({ deviceId: 1, deviceUserId: 1 }, { unique: true });
++biometricSchemas.BiometricMapping.index({ deviceId: 1, memberId: 1 }, { unique: true });
++biometricSchemas.BiometricAccess.index({ deviceId: 1, memberId: 1 }, { unique: true });
++biometricSchemas.BiometricCommand.index({ connectorId: 1, status: 1, nextAttempt: 1, leaseUntil: 1 });
++biometricSchemas.BiometricEvent.index({ gymId: 1, deviceId: 1, eventId: 1 }, { unique: true });
++biometricSchemas.BiometricEvent.index({ gymId: 1, memberId: 1, deviceUserId: 1 });
++biometricSchemas.BiometricCheckpoint.index({ deviceId: 1, generation: 1 }, { unique: true });
++biometricSchemas.BiometricAudit.index({ gymId: 1, createdAt: -1 });
+diff --git a/src/biometric/biometric.service.ts b/src/biometric/biometric.service.ts
+new file mode 100644
+index 0000000..1fc5104
+--- /dev/null
++++ b/src/biometric/biometric.service.ts
+@@ -0,0 +1,405 @@
++import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
++import { InjectConnection } from '@nestjs/mongoose';
++import { ConfigService } from '@nestjs/config';
++import { JwtService } from '@nestjs/jwt';
++import { Connection, Types } from 'mongoose';
++import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
++import { activeSuperAdminCheck, DENY_ALL, resolveVerifiedCallerScope, toObjectIdOrNull } from '../common/scope/tenant-scope';
++import { AccessDto, BatchDto, DeviceDto, HeartbeatDto, MappingDto, PairDto, ReportDto, ResultDto, TokenDto } from './biometric.dto';
++
++export const digest = (value: string) => createHash('sha256').update(value).digest('hex');
++export const eventIdentity = (deviceId: string, generation: string, nativeId: string) => digest(JSON.stringify([deviceId, generation, nativeId]));
++const oid = (id: string) => { const value = toObjectIdOrNull(id); if (!value) throw new NotFoundException(); return value; };
++const equal = (a: string, b: string) => !!a && !!b && a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
++const activeStatuses = ['pending', 'leased', 'running'];
++const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
++
++@Injectable()
++export class BiometricService {
++  readonly jwt = new JwtService();
++  constructor(@InjectConnection() readonly connection: Connection, private readonly config: ConfigService) {}
++  private c(name: string): any { return this.connection.db.collection('biometric' + name); }
++  private get key() {
++    const secret = this.config.get<string>('auth.jwtSecret');
++    if (!secret || secret.length < 32) throw new Error('Biometric signing requires configured auth.jwtSecret');
++    return createHmac('sha256', secret).update('zenvore:biometric:connector:v1').digest('hex');
++  }
++  private async tx<T>(work: (session: any) => Promise<T>): Promise<T> {
++    const session = await this.connection.startSession();
++    try { return await session.withTransaction(() => work(session)); }
++    finally { await session.endSession(); }
++  }
++  async gym(user: any, id: string) {
++    if (!user || ['member', 'trainer'].includes(user.role)) throw new ForbiddenException();
++    const scope = await resolveVerifiedCallerScope(user, activeSuperAdminCheck(this.connection.db as any));
++    const gym = await this.connection.db.collection('gyms').findOne({ _id: oid(id), isActive: true });
++    if (scope === DENY_ALL || !gym || !(scope.isSuperAdmin || (String(gym.tenantId) === String(scope.tenantId) && (!scope.gymId || String(gym._id) === String(scope.gymId))))) throw new NotFoundException();
++    return gym;
++  }
++  private audit(gym: any, actor: string, action: string, target: any, session?: any) {
++    return this.c('audits').insertOne({ tenantId: gym.tenantId, gymId: gym._id, actorId: oid(actor), action,
++      targetId: target, createdAt: new Date() }, { session });
++  }
++  async issuePairing(gym: any, actor: string) {
++    const code = randomBytes(6).toString('hex').toUpperCase();
++    const expiresAt = new Date(Date.now() + 300000);
++    await this.tx(async session => {
++      await this.c('pairings').updateMany({ gymId: gym._id, consumedAt: null }, { $set: { revokedAt: new Date() } }, { session });
++      await this.c('pairings').insertOne({ verifier: digest(code), gymId: gym._id, tenantId: gym.tenantId,
++        createdBy: oid(actor), createdAt: new Date(), expiresAt, consumedAt: null, revokedAt: null }, { session });
++      await this.audit(gym, actor, 'PAIRING_ISSUED', gym._id, session);
++    });
++    return { code, expiresAt };
++  }
++  async pair(dto: PairDto) {
++    const credential = randomBytes(32).toString('hex'), connectorId = new Types.ObjectId();
++    return this.tx(async session => {
++      const pair = await this.c('pairings').findOneAndUpdate({ verifier: digest(dto.code), consumedAt: null,
++        expiresAt: { $gt: new Date() }, revokedAt: null }, { $set: { consumedAt: new Date() } }, { session, returnDocument: 'after' });
++      if (!pair) throw new UnauthorizedException('PAIRING_INVALID');
++      const gym = await this.connection.db.collection('gyms').findOne({ _id: pair.gymId, tenantId: pair.tenantId, isActive: true }, { session });
++      const tenant = await this.connection.db.collection('tenants').findOne({ _id: pair.tenantId, isActive: true }, { session });
++      if (!gym || !tenant) throw new UnauthorizedException('PAIRING_INVALID');
++      await this.c('connectors').insertOne({ _id: connectorId, tenantId: pair.tenantId, gymId: pair.gymId,
++        credentialVerifier: digest(credential), credentialVersion: 1, credentialRotatedAt: new Date(),
++        revokedAt: null, createdAt: new Date(), appVersion: dto.appVersion }, { session });
++      await this.audit(gym, String(pair.createdBy), 'CONNECTOR_PAIRED', connectorId, session);
++      return { connectorId: String(connectorId), credential };
++    });
++  }
++  async active(id: string) {
++    const connector = await this.c('connectors').findOne({ _id: oid(id), revokedAt: null });
++    if (!connector) throw new UnauthorizedException('CONNECTOR_REVOKED');
++    const gym = await this.connection.db.collection('gyms').findOne({ _id: connector.gymId, tenantId: connector.tenantId, isActive: true });
++    const tenant = await this.connection.db.collection('tenants').findOne({ _id: connector.tenantId, isActive: true });
++    if (!gym || !tenant) throw new UnauthorizedException('CONNECTOR_REVOKED');
++    return connector;
++  }
++  async token(dto: TokenDto) {
++    const connector = await this.active(dto.connectorId);
++    const verifier = digest(dto.credential);
++    if (!equal(verifier, connector.credentialVerifier) &&
++      !(connector.previousUntil > new Date() && equal(verifier, connector.previousVerifier))) throw new UnauthorizedException('CREDENTIAL_INVALID');
++    return { accessToken: this.jwt.sign({ sub: dto.connectorId, kind: 'biometric', version: connector.credentialVersion },
++      { secret: this.key, algorithm: 'HS256', issuer: 'zenvore-biometric', audience: 'zenvore-connector', expiresIn: 900 }), expiresIn: 900,
++      rotateCredential: Date.now() - new Date(connector.credentialRotatedAt ?? connector.createdAt).getTime() > 30 * 86400000 };
++  }
++  async authenticate(header: string) {
++    try {
++      if (!header?.startsWith('Bearer ')) throw new Error();
++      const claims = this.jwt.verify(header.slice(7), { secret: this.key, algorithms: ['HS256'], issuer: 'zenvore-biometric', audience: 'zenvore-connector' });
++      if (claims.kind !== 'biometric') throw new Error();
++      return await this.active(claims.sub);
++    } catch { throw new UnauthorizedException('CONNECTOR_AUTH'); }
++  }
++  async rotate(connector: any) {
++    const credential = randomBytes(32).toString('hex');
++    const updated = await this.c('connectors').updateOne({ _id: connector._id, revokedAt: null,
++      credentialVersion: connector.credentialVersion, $or: [{ previousUntil: { $exists: false } }, { previousUntil: { $lt: new Date() } }] },
++      { $set: { credentialVerifier: digest(credential), previousVerifier: connector.credentialVerifier,
++        previousUntil: new Date(Date.now() + 86400000), credentialRotatedAt: new Date() }, $inc: { credentialVersion: 1 } });
++    if (!updated.modifiedCount) throw new ConflictException('ROTATION_GRACE_ACTIVE');
++    return { connectorId: String(connector._id), credential };
++  }
++  async heartbeat(connector: any, dto: HeartbeatDto) {
++    await this.c('connectors').updateOne({ _id: connector._id, revokedAt: null },
++      { $set: { lastHeartbeat: new Date(), appVersion: dto.appVersion, health: dto } });
++    return { receivedAt: new Date() };
++  }
++  async device(connector: any, deviceId: string) {
++    const device = await this.c('devices').findOne({ _id: oid(deviceId), connectorId: connector._id, gymId: connector.gymId, tenantId: connector.tenantId });
++    if (!device) throw new NotFoundException();
++    return device;
++  }
++  async adminDevice(gym: any, id: string) {
++    const device = await this.c('devices').findOne({ _id: oid(id), gymId: gym._id, tenantId: gym.tenantId });
++    if (!device) throw new NotFoundException();
++    return device;
++  }
++  async devices(connector: any) {
++    return this.c('devices').find({ connectorId: connector._id, gymId: connector.gymId, tenantId: connector.tenantId }).limit(16).toArray();
++  }
++  async addDevice(gym: any, actor: string, dto: DeviceDto) {
++    try { new Intl.DateTimeFormat('en', { timeZone: dto.timezone }).format(); } catch { throw new BadRequestException('INVALID_TIMEZONE'); }
++    if (new Date(dto.historySince) > new Date() || Date.now() - new Date(dto.historySince).getTime() > 31 * 86400000)
++      throw new BadRequestException('Initial history must be within the last 31 days');
++    if (dto.adapter === 'simulator' && dto.ip !== '127.0.0.1') throw new BadRequestException('SIMULATOR_LOOPBACK_ONLY');
++    const connector = await this.c('connectors').findOne({ _id: oid(dto.connectorId), gymId: gym._id, tenantId: gym.tenantId, revokedAt: null });
++    if (!connector) throw new NotFoundException();
++    if (await this.c('devices').countDocuments({ gymId: gym._id }) >= 16) throw new BadRequestException('DEVICE_LIMIT');
++    const deviceId = new Types.ObjectId();
++    await this.tx(async session => {
++      await this.c('devices').insertOne({ ...dto, connectorId: connector._id, _id: deviceId, gymId: gym._id,
++        tenantId: gym.tenantId, createdAt: new Date(), ...(dto.expectedIdentity ? { identity: dto.expectedIdentity } : {}), capabilities: { attendance: false, access: false, expiry: false }, report: { reachable: false } }, { session });
++      await this.audit(gym, actor, 'DEVICE_ASSIGNED', deviceId, session);
++    });
++    return { deviceId: String(deviceId) };
++  }
++  async report(connector: any, id: string, dto: ReportDto) {
++    const device = await this.device(connector, id);
++    if (dto.reachable && !dto.identity) throw new BadRequestException('HANDSHAKE_REQUIRED');
++    if (device.identity && dto.identity && device.identity !== dto.identity) throw new ConflictException('IDENTITY_MISMATCH');
++    // Reachable is backed by an adapter handshake, never connector authentication.
++    const values: any = { report: { ...dto, receivedAt: new Date(), ...(dto.reachable ? { lastCommunication: new Date() } : { lastCommunication: device.report?.lastCommunication }) } };
++    if ((dto.ip === undefined) !== (dto.port === undefined)) throw new BadRequestException('ENDPOINT_INCOMPLETE');
++    if (dto.ip !== undefined) {
++      if (!dto.reachable || !device.identity || dto.identity !== device.identity || (device.adapter === 'simulator' && dto.ip !== '127.0.0.1'))
++        throw new BadRequestException('ENDPOINT_IDENTITY_REQUIRED');
++      values.ip = dto.ip; values.port = dto.port;
++    }
++    if (dto.reachable) { values.identity = dto.identity; values.capabilities = { attendance: dto.attendance, access: dto.access, expiry: dto.expiry }; }
++    try { await this.c('devices').updateOne({ _id: device._id }, { $set: values }); }
++    catch (e) { if (e.code === 11000) throw new ConflictException('DEVICE_ALREADY_ASSIGNED'); throw e; }
++    return { reported: true };
++  }
++  private newCommand(gym: any, connectorId: any, deviceId: any, type: string, payload: any, actor?: string) {
++    return { _id: new Types.ObjectId(), tenantId: gym.tenantId, gymId: gym._id, connectorId, deviceId, type, payload,
++      status: 'pending', attempts: 0, createdAt: new Date(), expiresAt: new Date(Date.now() + 86400000),
++      nextAttempt: new Date(), ...(actor ? { createdBy: oid(actor) } : {}) };
++  }
++  async queue(gym: any, actor: string, deviceId: string, type: string) {
++    const device = await this.adminDevice(gym, deviceId);
++    const connector = await this.active(String(device.connectorId));
++    if (type === 'SYNC_ATTENDANCE' && !device.capabilities?.attendance) throw new BadRequestException('ATTENDANCE_UNSUPPORTED');
++    const command = this.newCommand(gym, connector._id, device._id, type, {}, actor);
++    await this.tx(async session => {
++      if (await this.c('commands').countDocuments({ connectorId: connector._id, status: { $in: activeStatuses } }, { session }) >= 100)
++        throw new ConflictException('COMMAND_QUEUE_FULL');
++      await this.c('commands').insertOne(command, { session });
++      await this.audit(gym, actor, type + '_QUEUED', command._id, session);
++    });
++    return { commandId: String(command._id) };
++  }
++  async discover(gym: any, actor: string, connectorId: string) {
++    const connector = await this.c('connectors').findOne({ _id: oid(connectorId), gymId: gym._id, tenantId: gym.tenantId, revokedAt: null });
++    if (!connector) throw new NotFoundException();
++    const command = this.newCommand(gym, connector._id, null, 'DISCOVER_DEVICES', {}, actor);
++    await this.tx(async session => {
++      if (await this.c('commands').countDocuments({ connectorId: connector._id, status: { $in: activeStatuses } }, { session }) >= 100)
++        throw new ConflictException('COMMAND_QUEUE_FULL');
++      await this.c('commands').insertOne(command, { session });
++      await this.audit(gym, actor, 'DISCOVERY_REQUESTED', command._id, session);
++    });
++    return { commandId: String(command._id) };
++  }
++  async commands(connector: any, seconds: number) {
++    const until = Date.now() + seconds * 1000;
++    do {
++      await this.active(String(connector._id));
++      const now = new Date();
++      await this.c('commands').updateMany({ connectorId: connector._id, status: { $in: activeStatuses },
++        $or: [{ expiresAt: { $lte: now } }, { attempts: { $gte: 3 }, leaseUntil: { $lte: now } }] },
++        { $set: { status: 'expired', completedAt: now } });
++      const command = await this.c('commands').findOneAndUpdate({ connectorId: connector._id, gymId: connector.gymId,
++        tenantId: connector.tenantId, expiresAt: { $gt: now }, attempts: { $lt: 3 },
++        $or: [{ status: 'pending', nextAttempt: { $lte: now } }, { status: { $in: ['leased', 'running'] }, leaseUntil: { $lte: now } }] },
++        { $set: { status: 'leased', leaseToken: randomBytes(16).toString('hex'), leaseUntil: new Date(Date.now() + 120000) }, $inc: { attempts: 1 } },
++        { returnDocument: 'after', sort: { createdAt: 1 } });
++      if (command) return [command];
++      if (Date.now() >= until) return [];
++      await wait(Math.min(1000, until - Date.now()));
++    } while (true);
++  }
++  async ack(connector: any, id: string, leaseToken: string) {
++    const updated = await this.c('commands').updateOne({ _id: oid(id), connectorId: connector._id, leaseToken,
++      status: { $in: ['leased', 'running'] }, leaseUntil: { $gt: new Date() } },
++      { $set: { status: 'running', leaseUntil: new Date(Date.now() + 120000) } });
++    if (!updated.matchedCount) throw new ConflictException('LEASE_LOST');
++    return { acknowledged: true };
++  }
++  async result(connector: any, id: string, dto: ResultDto) {
++    return this.tx(async session => {
++      const command = await this.c('commands').findOne({ _id: oid(id), connectorId: connector._id }, { session });
++      if (!command) throw new NotFoundException();
++      if (command.leaseToken !== dto.leaseToken) throw new ConflictException('LEASE_LOST');
++      if (!activeStatuses.includes(command.status)) return { status: command.status }; // lost result acknowledgement
++      if (command.leaseUntil <= new Date()) throw new ConflictException('LEASE_LOST');
++      let status = dto.status;
++      if (command.type === 'SET_MEMBER_ACCESS') {
++        const state = await this.c('access').findOne({ deviceId: command.deviceId, memberId: oid(command.payload.memberId) }, { session });
++        if (!state || state.version !== command.payload.version) status = 'superseded';
++        else if (status === 'succeeded') await this.c('access').updateOne({ _id: state._id, version: state.version }, { $set: { confirmedVersion: state.version } }, { session });
++      }
++      if (status === 'failed' && dto.transient && command.attempts < 3 && command.expiresAt > new Date()) status = 'pending';
++      const { leaseToken, ...safeResult } = dto;
++      await this.c('commands').updateOne({ _id: command._id }, { $set: { status, result: { ...safeResult, status },
++        nextAttempt: new Date(Date.now() + Math.min(60, 2 ** command.attempts) * 1000),
++        ...(!activeStatuses.includes(status) ? { completedAt: new Date() } : {}) } }, { session });
++      return { status };
++    });
++  }
++  async member(gym: any, memberId: string, session?: any) {
++    const member = await this.connection.db.collection('members').findOne({ _id: oid(memberId), isActive: true }, { session });
++    const mapping = member && await this.connection.db.collection('usergymmappings').findOne({ _id: member.userGymMappingId,
++      userId: member.userId, tenantId: gym.tenantId, gymId: gym._id, isActive: true }, { session });
++    if (!mapping) throw new NotFoundException();
++    return member;
++  }
++  private async projectEvent(event: any, mapping: any, session: any) {
++    const member = await this.member({ tenantId: event.tenantId, _id: event.gymId }, String(mapping.memberId), session);
++    if (['check-in', 'check-out'].includes(event.eventType)) {
++      const shifted = new Date(event.occurredAt.getTime() - 3 * 3600000);
++      const localDate = new Intl.DateTimeFormat('en-CA', { timeZone: event.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(shifted);
++      await this.connection.db.collection('attendances').updateOne({ biometricEventKey: String(event._id) }, { $setOnInsert: {
++        biometricEventKey: String(event._id), userId: member.userId, memberId: member._id, gymId: event.gymId, tenantId: event.tenantId,
++        deviceId: String(event.deviceId), type: event.eventType, checkInTime: event.occurredAt,
++        ...(event.eventType === 'check-out' ? { checkOutTime: event.occurredAt } : {}),
++        localDate, status: 'VALID', isActive: true, createdAt: new Date(), updatedAt: new Date(), notes: 'Biometric attendance',
++      } }, { upsert: true, session });
++    }
++    await this.c('events').updateOne({ _id: event._id }, { $set: { memberId: mapping.memberId, resolvedAt: new Date() } }, { session });
++  }
++  async ingest(connector: any, dto: BatchDto) {
++    const device = await this.device(connector, dto.deviceId);
++    if (!device.capabilities?.attendance) throw new BadRequestException('ATTENDANCE_UNSUPPORTED');
++    if (new Set(dto.events.map(e => e.eventId)).size !== dto.events.length) throw new BadRequestException('DUPLICATE_BATCH_EVENT');
++    for (const event of dto.events) {
++      if (event.eventId !== eventIdentity(dto.deviceId, dto.generation, event.nativeId) || event.timezone !== device.timezone)
++        throw new BadRequestException('INVALID_EVENT_IDENTITY');
++      if (!/(Z|[+-]\d{2}:\d{2})$/.test(event.occurredAt) || new Date(event.occurredAt).getTime() > Date.now() + 86400000)
++        throw new BadRequestException('INVALID_EVENT_TIME');
++    }
++    return this.tx(async session => {
++      for (const row of dto.events) {
++        const query = { gymId: connector.gymId, deviceId: device._id, eventId: row.eventId };
++        let event = await this.c('events').findOne(query, { session });
++        if (event && (event.nativeId !== row.nativeId || event.deviceUserId !== row.deviceUserId ||
++          event.occurredAt.getTime() !== new Date(row.occurredAt).getTime() || event.eventType !== row.eventType))
++          throw new ConflictException('EVENT_ID_REUSED');
++        if (!event) {
++          event = { ...row, ...query, _id: new Types.ObjectId(), tenantId: connector.tenantId, generation: dto.generation,
++            occurredAt: new Date(row.occurredAt), createdAt: new Date() };
++          await this.c('events').insertOne(event, { session });
++        }
++        const mapping = await this.c('mappings').findOne({ deviceId: device._id, deviceUserId: event.deviceUserId }, { session });
++        if (mapping && !event.memberId) {
++          // A deleted/stale member mapping must not block every other scan.
++          // Keep the original event unresolved for an explicit mapping repair.
++          try { await this.projectEvent(event, mapping, session); }
++          catch (error) { if (!(error instanceof NotFoundException)) throw error; }
++        }
++      }
++      const query = { deviceId: device._id, generation: dto.generation };
++      const checkpoint = await this.c('checkpoints').findOne(query, { session });
++      const position = checkpoint && BigInt(checkpoint.position) > BigInt(dto.position) ? checkpoint.position : dto.position;
++      await this.c('checkpoints').updateOne(query, { $set: { ...query, tenantId: connector.tenantId, gymId: connector.gymId,
++        position, acknowledgedAt: new Date(), dataGap: dto.dataGap || !!checkpoint?.dataGap } }, { upsert: true, session });
++      return { committed: true, acceptedEventIds: dto.events.map(e => e.eventId), position: dto.position, generation: dto.generation };
++    });
++  }
++  async map(gym: any, actor: string, deviceId: string, dto: MappingDto) {
++    const device = await this.adminDevice(gym, deviceId);
++    return this.tx(async session => {
++      await this.member(gym, dto.memberId, session);
++      const old = await this.c('mappings').findOne({ deviceId: device._id, deviceUserId: dto.deviceUserId }, { session });
++      if (old && String(old.memberId) !== dto.memberId) throw new ConflictException('MAPPING_IMMUTABLE');
++      await this.c('mappings').updateOne({ deviceId: device._id, deviceUserId: dto.deviceUserId }, { $setOnInsert: {
++        tenantId: gym.tenantId, gymId: gym._id, deviceId: device._id, deviceUserId: dto.deviceUserId,
++        memberId: oid(dto.memberId), createdAt: new Date() } }, { session, upsert: true });
++      // Bounded page: further pages can be resolved by repeating this operation.
++      const unresolved = await this.c('events').find({ deviceId: device._id, deviceUserId: dto.deviceUserId,
++        memberId: { $exists: false } }, { session }).limit(200).toArray();
++      for (const event of unresolved) await this.projectEvent(event, { memberId: oid(dto.memberId) }, session);
++      await this.audit(gym, actor, 'MEMBER_MAPPED', device._id, session);
++      return { mapped: true, resolvedCount: unresolved.length, more: unresolved.length === 200 };
++    });
++  }
++  async setAccess(gym: any, actor: string, deviceId: string, memberId: string, dto: AccessDto) {
++    const device = await this.adminDevice(gym, deviceId);
++    if (!device.capabilities?.access || (dto.expiresAt && !device.capabilities?.expiry)) throw new BadRequestException('ACCESS_UNSUPPORTED');
++    return this.tx(async session => {
++      await this.member(gym, memberId, session);
++      const mapping = await this.c('mappings').findOne({ deviceId: device._id, memberId: oid(memberId) }, { session });
++      if (!mapping) throw new BadRequestException('MEMBER_NOT_MAPPED');
++      const state = await this.c('access').findOneAndUpdate({ deviceId: device._id, memberId: oid(memberId) },
++        { $set: { tenantId: gym.tenantId, gymId: gym._id, enabled: dto.enabled, expiresAt: dto.expiresAt ?? null,
++          deviceUserId: mapping.deviceUserId }, $inc: { version: 1 } }, { session, upsert: true, returnDocument: 'after' });
++      await this.c('commands').updateMany({ deviceId: device._id, type: 'SET_MEMBER_ACCESS', 'payload.memberId': memberId,
++        status: { $in: activeStatuses } }, { $set: { status: 'superseded', completedAt: new Date() } }, { session });
++      const command = this.newCommand(gym, device.connectorId, device._id, 'SET_MEMBER_ACCESS',
++        { memberId, version: state.version }, actor);
++      await this.c('commands').insertOne(command, { session });
++      await this.audit(gym, actor, 'ACCESS_DESIRED_CHANGED', command._id, session);
++      return { commandId: String(command._id), version: state.version };
++    });
++  }
++  async access(connector: any, deviceId: string, after = '') {
++    await this.device(connector, deviceId);
++    const query: any = { deviceId: oid(deviceId), gymId: connector.gymId, tenantId: connector.tenantId };
++    if (after) query._id = { $gt: oid(after) };
++    const states = await this.c('access').find(query).sort({ _id: 1 }).limit(200).toArray();
++    return { states, next: states.length === 200 ? String(states[states.length - 1]._id) : null };
++  }
++  async observed(connector: any, deviceId: string, dto: any) {
++    await this.device(connector, deviceId);
++    const state = await this.c('access').findOne({ deviceId: oid(deviceId), memberId: oid(dto.memberId),
++      gymId: connector.gymId, tenantId: connector.tenantId });
++    if (!state || state.version !== dto.version || state.enabled !== dto.enabled || (state.expiresAt ?? null) !== (dto.expiresAt ?? null))
++      throw new ConflictException('ACCESS_STATE_SUPERSEDED');
++    const updated = await this.c('access').updateOne({ _id: state._id, version: dto.version }, { $set: { confirmedVersion: dto.version } });
++    if (!updated.matchedCount) throw new ConflictException('ACCESS_STATE_SUPERSEDED');
++    return { confirmedVersion: dto.version };
++  }
++  async updateDevice(gym: any, actor: string, deviceId: string, dto: DeviceDto) {
++    const device = await this.adminDevice(gym, deviceId);
++    const target = await this.c('connectors').findOne({ _id: oid(dto.connectorId), gymId: gym._id, tenantId: gym.tenantId, revokedAt: null });
++    if (!target) throw new NotFoundException();
++    if (String(device.connectorId) !== dto.connectorId) {
++      const old = await this.c('connectors').findOne({ _id: device.connectorId });
++      if (old && !old.revokedAt) throw new ConflictException('REVOKE_PREVIOUS_CONNECTOR_FIRST');
++    }
++    try { new Intl.DateTimeFormat('en', { timeZone: dto.timezone }).format(); } catch { throw new BadRequestException('INVALID_TIMEZONE'); }
++    if (dto.ip !== '127.0.0.1') throw new BadRequestException('SIMULATOR_LOOPBACK_ONLY');
++    if (device.timezone !== dto.timezone || device.historySince !== dto.historySince || device.adapter !== dto.adapter)
++      throw new ConflictException('HISTORY_AND_ADAPTER_IMMUTABLE');
++    await this.tx(async session => {
++      await this.c('devices').updateOne({ _id: device._id }, { $set: { connectorId: target._id, ip: dto.ip, port: dto.port,
++        report: { reachable: false } } }, { session });
++      await this.c('commands').updateMany({ deviceId: device._id, status: { $in: activeStatuses } },
++        { $set: { status: 'superseded', completedAt: new Date() } }, { session });
++      await this.audit(gym, actor, 'DEVICE_CONFIGURED', device._id, session);
++    });
++    return { deviceId };
++  }
++  async status(gym: any) {
++    const connectors = await this.c('connectors').find({ gymId: gym._id, tenantId: gym.tenantId },
++      { projection: { credentialVerifier: 0, previousVerifier: 0 } }).sort({ createdAt: -1 }).limit(32).toArray();
++    const grace = Math.max(90, Math.min(900, Number(this.config.get('BIOMETRIC_OFFLINE_SECONDS')) || 180));
++    for (const connector of connectors) connector.online = !connector.revokedAt && !!connector.lastHeartbeat && Date.now() - connector.lastHeartbeat.getTime() < grace * 1000;
++    const devices = await this.c('devices').find({ gymId: gym._id, tenantId: gym.tenantId }).limit(16).toArray();
++    const commands = await this.c('commands').find({ gymId: gym._id, tenantId: gym.tenantId }, { projection: { leaseToken: 0 } }).sort({ createdAt: -1 }).limit(50).toArray();
++    const unresolved = await this.c('events').aggregate([{ $match: { gymId: gym._id, memberId: { $exists: false } } },
++      { $group: { _id: { deviceId: '$deviceId', deviceUserId: '$deviceUserId' }, count: { $sum: 1 } } }, { $limit: 100 }]).toArray();
++    const checkpoints = await this.c('checkpoints').find({ gymId: gym._id }).limit(100).toArray();
++    const pendingAccess = await this.c('access').countDocuments({ gymId: gym._id, $expr: { $ne: ['$version', { $ifNull: ['$confirmedVersion', 0] }] } });
++    const installerUrl = this.config.get<string>('BIOMETRIC_INSTALLER_URL');
++    const installerSha256 = this.config.get<string>('BIOMETRIC_INSTALLER_SHA256');
++    let download: any = null;
++    if (installerUrl && /^https:\/\//.test(installerUrl) && /^[a-f0-9]{64}$/.test(installerSha256 ?? '')) download = { url: installerUrl, sha256: installerSha256 };
++    const accessStates = await this.c('access').find({ gymId: gym._id, tenantId: gym.tenantId }).limit(200).toArray();
++    return { connectors, devices, commands, unresolved, checkpoints, pendingAccess, accessStates, download, offlineAfterSeconds: grace };
++  }
++  async revoke(gym: any, actor: any, id: string) {
++    if (!['gym_owner', 'super_admin'].includes(actor.role)) throw new ForbiddenException();
++    await this.tx(async session => {
++      const found = await this.c('connectors').updateOne({ _id: oid(id), gymId: gym._id, tenantId: gym.tenantId },
++        { $set: { revokedAt: new Date() }, $unset: { credentialVerifier: '', previousVerifier: '' } }, { session });
++      if (!found.matchedCount) throw new NotFoundException();
++      await this.c('commands').updateMany({ connectorId: oid(id), status: { $in: activeStatuses } }, { $set: { status: 'expired', completedAt: new Date() } }, { session });
++      await this.audit(gym, actor.userId, 'CONNECTOR_REVOKED', oid(id), session);
++    });
++    return { revoked: true };
++  }
++  async support(gym: any, actor: string, consent: boolean) {
++    if (consent !== true) throw new BadRequestException('EXPLICIT_CONSENT_REQUIRED');
++    const status = await this.status(gym);
++    // Allowlist diagnostic counters only; no free text, credentials, IPs or member data.
++    const diagnostics = { connectors: status.connectors.map(c => ({ id: c._id, online: c.online, version: c.appVersion,
++      lastHeartbeat: c.lastHeartbeat, errorCode: c.health?.errorCode })), deviceCount: status.devices.length,
++      pendingAccess: status.pendingAccess, unresolvedUsers: status.unresolved.length };
++    const result = await this.c('support').insertOne({ gymId: gym._id, tenantId: gym.tenantId, createdBy: oid(actor),
++      diagnostics, status: 'open', createdAt: new Date() });
++    await this.audit(gym, actor, 'SUPPORT_REQUESTED', result.insertedId);
++    return { requestId: String(result.insertedId) };
++  }
++}
+diff --git a/src/biometric/connector.guard.ts b/src/biometric/connector.guard.ts
+new file mode 100644
+index 0000000..5531195
+--- /dev/null
++++ b/src/biometric/connector.guard.ts
+@@ -0,0 +1,14 @@
++import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
++import { BiometricService } from './biometric.service';
++
++// These routes bypass the HUMAN JWT guard only; this guard authenticates every
++// connector request and checks revocation + active tenant/gym in the database.
++@Injectable()
++export class ConnectorGuard implements CanActivate {
++  constructor(private readonly service: BiometricService) {}
++  async canActivate(context: ExecutionContext) {
++    const req = context.switchToHttp().getRequest();
++    req.connector = await this.service.authenticate(req.headers.authorization);
++    return true;
++  }
++}
+diff --git a/src/dashboard/manager-dashboard.service.ts b/src/dashboard/manager-dashboard.service.ts
+index 73bcb50..f822821 100644
+--- a/src/dashboard/manager-dashboard.service.ts
++++ b/src/dashboard/manager-dashboard.service.ts
+@@ -1,3 +1,4 @@
++import { biometricAttendanceFilter } from '../attendance/biometric-attendance-scope';
+ import { Injectable } from "@nestjs/common";
+ import { InjectModel } from "@nestjs/mongoose";
+ import { Model, Types } from "mongoose";
+@@ -286,6 +287,7 @@ export class ManagerDashboardService {
+       // through the checked-in user's mapping — same hop /attendance uses.
+       this.attendanceModel.countDocuments({
+         ...userScope,
++        ...biometricAttendanceFilter(scopedGymIds ?? undefined),
+         checkInTime: { $gte: startOfMonth },
+       }),
+       this.attendanceModel.countDocuments({
+diff --git a/src/error-tracking/error-reporting.spec.ts b/src/error-tracking/error-reporting.spec.ts
+index e8d8bdc..190dc99 100644
+--- a/src/error-tracking/error-reporting.spec.ts
++++ b/src/error-tracking/error-reporting.spec.ts
+@@ -254,3 +254,15 @@ test('SSO error records omit proof-bearing bodies and redact the client credenti
+   assert.deepEqual(stored.body, {});
+   assert.equal(stored.headers['x-marketing-sso-secret'], '[REDACTED]');
+ });
++
++test('connector protocol failures never persist credentials, pairing codes or raw attendance bodies', async () => {
++  for (const path of ['/api/v1/connectors/pair', '/api/v1/connectors/token', '/api/v1/connectors/me/attendance/batches']) {
++    const f = setup();
++    f.request.path = path;
++    f.request.body = { code: 'pairing-secret', credential: 'installation-secret', events: [{ deviceUserId: 'private-user', fingerprint: 'excluded-template' }] };
++    await f.filter.catch(Error('failure'), f.host);
++    const stored = f.calls.find(c => c[0] === 'create')[1];
++    assert.deepEqual(stored.body, {});
++    assert.equal(f.request.body.credential, 'installation-secret');
++  }
++});
+diff --git a/src/error-tracking/filters/global-exception.filter.ts b/src/error-tracking/filters/global-exception.filter.ts
+index 05a4b6c..d85f228 100644
+--- a/src/error-tracking/filters/global-exception.filter.ts
++++ b/src/error-tracking/filters/global-exception.filter.ts
+@@ -79,7 +79,7 @@ export class GlobalExceptionFilter implements ExceptionFilter {
+     );
+ 
+     // Sanitize request body (remove sensitive fields)
+-    const sanitizedBody = request.path?.includes("/marketing-sso/") ? {} : this.sanitizeBody(request.body);
++    const sanitizedBody = (request.path?.includes("/marketing-sso/") || /(?:^|\/)connectors(?:\/|$)/.test(request.path ?? "")) ? {} : this.sanitizeBody(request.body);
+     const sanitizedHeaders = this.sanitizeHeaders(request.headers);
+ 
+     // Extract user info from JWT if available
+@@ -277,6 +277,9 @@ export class GlobalExceptionFilter implements ExceptionFilter {
+     const sanitized = { ...body };
+     const sensitiveFields = [
+       "password",
++      "credential",
++      "pairingCode",
++      "commkey",
+       "token",
+       "secret",
+       "otp",
+diff --git a/src/error-tracking/sentry-scrub.spec.ts b/src/error-tracking/sentry-scrub.spec.ts
+index 29190a1..36460b4 100644
+--- a/src/error-tracking/sentry-scrub.spec.ts
++++ b/src/error-tracking/sentry-scrub.spec.ts
+@@ -109,3 +109,15 @@ test('SSO codes, proofs and client credential never leave in Sentry events', ()
+   assert.equal(event.request.data as any, REDACTED);
+   assert.equal(event.request.headers['x-marketing-sso-secret'], REDACTED);
+ });
++
++test('connector pairing and attendance payloads are excluded from third-party diagnostics', () => {
++  for (const route of ['pair', 'token', 'me/attendance/batches']) {
++    const event: any = scrubEvent({ request: { url: 'https://api.test/api/v1/connectors/' + route,
++      data: { code: 'pair-secret', credential: 'installation-secret', events: [{ deviceUserId: 'private-user' }] } },
++      extra: { credential: 'installation-secret', nested: { commkey: 'device-key', fingerprint: 'template' } } });
++    assert.equal(event.request.data, REDACTED);
++    assert.ok(!JSON.stringify(event).includes('installation-secret'));
++    assert.ok(!JSON.stringify(event).includes('private-user'));
++    assert.ok(!JSON.stringify(event).includes('device-key'));
++  }
++});
+diff --git a/src/error-tracking/sentry-scrub.ts b/src/error-tracking/sentry-scrub.ts
+index 7147899..454c5f4 100644
+--- a/src/error-tracking/sentry-scrub.ts
++++ b/src/error-tracking/sentry-scrub.ts
+@@ -35,7 +35,7 @@
+  * behind an event. The Sentry event keeps `tenant_id`, `gym_id` and a user id.
+  */
+ export const SENSITIVE_KEY_PATTERN =
+-  /(otp|password|passwd|token|secret|signature|authorization|cookie|api[-_]?key|cvv|card[-_]?number|phone|mobile|email|full[-_]?name|address|aadhaar|emergency[-_]?contact)/i;
++  /(otp|password|passwd|token|secret|credential|pairing[-_]?code|commkey|fingerprint|signature|authorization|cookie|api[-_]?key|cvv|card[-_]?number|phone|mobile|email|full[-_]?name|address|aadhaar|emergency[-_]?contact)/i;
+ 
+ export const REDACTED = "[REDACTED]";
+ 
+@@ -95,7 +95,7 @@ export function scrubEvent<T>(event: T): T {
+   // worth sending. `scrub` never un-marks on the way out, so the set must not
+   // outlive the tree it is guarding.
+   if (e.request?.data) {
+-    e.request.data = e.request.url?.includes("/marketing-sso/")
++    e.request.data = (e.request.url?.includes("/marketing-sso/") || /(?:^|\/)connectors(?:\/|$)/.test(e.request.url ?? ""))
+       ? REDACTED : scrub(e.request.data, new WeakSet<object>());
+   }
+   if (e.request?.headers) {
+diff --git a/.env.biometric.example b/.env.biometric.example
+new file mode 100644
+index 0000000..838b533
+--- /dev/null
++++ b/.env.biometric.example
+@@ -0,0 +1,7 @@
++# Optional biometric connector settings. Merge into your deployment environment.
++# The existing Mongo connection must use a replica set for transactions.
++BIOMETRIC_OFFLINE_SECONDS=180
++
++# Enable downloads only after building, signing and verifying an immutable release.
++# BIOMETRIC_INSTALLER_URL=https://downloads.example.invalid/biometric/0.1.0/ZenvoreBiometricConnector-0.1.0-windows-x64.exe
++# BIOMETRIC_INSTALLER_SHA256=<verified lowercase SHA-256, 64 hex characters>
+diff --git a/src/attendance/biometric-attendance-scope.ts b/src/attendance/biometric-attendance-scope.ts
+new file mode 100644
+index 0000000..754b30b
+--- /dev/null
++++ b/src/attendance/biometric-attendance-scope.ts
+@@ -0,0 +1,7 @@
++import { Types } from 'mongoose';
++
++/** Biometric attendance is owned by its source gym, even for multi-gym users. */
++export function biometricAttendanceFilter(gymIds?: Types.ObjectId[], tenantId?: Types.ObjectId): any {
++  if (!gymIds && !tenantId) return {};
++  return { $or: [{ biometricEventKey: { $exists: false } }, gymIds ? { gymId: { $in: gymIds } } : { tenantId }] };
++}
+diff --git a/src/biometric/biometric.integration.spec.ts b/src/biometric/biometric.integration.spec.ts
+new file mode 100644
+index 0000000..56fa10c
+--- /dev/null
++++ b/src/biometric/biometric.integration.spec.ts
+@@ -0,0 +1,238 @@
++/** Isolated replica-set + real HTTP + Python connector. Never reads configured DBs. */
++import 'reflect-metadata';
++import * as assert from 'node:assert/strict';
++import { after, before, test } from 'node:test';
++import { Module, ValidationPipe } from '@nestjs/common';
++import { NestFactory } from '@nestjs/core';
++import { ConfigService } from '@nestjs/config';
++import { MongooseModule, getConnectionToken } from '@nestjs/mongoose';
++import { Connection, Types } from 'mongoose';
++import { MongoMemoryReplSet } from 'mongodb-memory-server';
++import { execFile } from 'node:child_process';
++import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { resolve, join } from 'node:path';
++import { biometricSchemas } from './biometric.schemas';
++import { BiometricService, digest } from './biometric.service';
++import { ConnectorGuard } from './connector.guard';
++import { ConnectorController, ConnectorRegistrationController } from './biometric.controller';
++import { AttendanceService } from '../attendance/attendance.service';
++import { AnalyticsService } from '../analytics/analytics.service';
++import { AttendanceSchema } from '../attendance/schemas/attendance.schema';
++
++let replica: MongoMemoryReplSet, app: any, connection: Connection, service: BiometricService, base: string, temporary: string;
++const id = () => new Types.ObjectId();
++const tenantA = id(), tenantB = id(), gymA = id(), gymB = id(), actor = id();
++const source = resolve(__dirname, '../../..', 'Gym-saas-biometrics/src');
++const collection = (name: string): any => connection.db.collection(name);
++
++before(async () => {
++  replica = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
++  @Module({
++    imports: [MongooseModule.forRoot(replica.getUri('biometric_integration')),
++      MongooseModule.forFeature([...Object.entries(biometricSchemas).map(([name, schema]) => ({ name, schema })), { name: 'Attendance', schema: AttendanceSchema }])],
++    controllers: [ConnectorController, ConnectorRegistrationController],
++    providers: [BiometricService, ConnectorGuard, { provide: ConfigService, useValue: new ConfigService({ auth: { jwtSecret: 'isolated-biometric-test-secret-32-characters-only' } }) }],
++  }) class IntegrationModule {}
++  app = await NestFactory.create(IntegrationModule, { logger: false });
++  app.setGlobalPrefix('api/v1');
++  app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
++  await app.listen(0, '127.0.0.1');
++  base = await app.getUrl() + '/api/v1';
++  service = app.get(BiometricService);
++  connection = app.get(getConnectionToken());
++  await Promise.all(Object.values(connection.models).map(model => model.createIndexes()));
++  await collection('tenants').insertMany([{ _id: tenantA, isActive: true }, { _id: tenantB, isActive: true }]);
++  await collection('gyms').insertMany([{ _id: gymA, tenantId: tenantA, isActive: true }, { _id: gymB, tenantId: tenantB, isActive: true }]);
++  temporary = await mkdtemp(join(tmpdir(), 'zenvore-integration-'));
++});
++after(async () => { if (app) await app.close(); if (replica) await replica.stop(); if (temporary) await rm(temporary, { recursive: true, force: true }); });
++
++async function http(method: string, route: string, body?: any, token?: string) {
++  const response = await fetch(base + route, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
++    ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
++  return { status: response.status, body: await response.json() };
++}
++const gym = () => ({ _id: gymA, tenantId: tenantA });
++async function installation() {
++  const code = await service.issuePairing(gym(), String(actor));
++  const pair = await service.pair({ code: code.code, appVersion: '0.1.0' });
++  const connector = await service.active(pair.connectorId);
++  const token = await service.token(pair);
++  return { pair, connector, token: token.accessToken };
++}
++const pythonScript = 
++'import json,sys\n' +
++'from pathlib import Path\n' +
++'from zenvore_connector.config import Config\n' +
++'from zenvore_connector.main import build\n' +
++'from zenvore_connector.cloud import CloudError\n' +
++'r=build(Config.load(Path(sys.argv[1])))\n' +
++'mode=sys.argv[2]\n' +
++'if mode=="pair": r.cloud.pair(sys.stdin.read().strip())\n' +
++'if mode=="lost-ack":\n' +
++' original=r.cloud.request\n' +
++' def lose(method,route,body=None,timeout=None):\n' +
++'  result=original(method,route,body,timeout)\n' +
++'  if route=="/connectors/me/attendance/batches": raise CloudError("CLOUD_NETWORK")\n' +
++'  return result\n' +
++' r.cloud.request=lose\n' +
++'if mode in ("sync","lost-ack"): r.heartbeat_once(); r.scheduled_once(); r.heartbeat_once()\n' +
++'if mode=="command":\n' +
++' for command in r.cloud.request("GET","/connectors/me/commands"): r.handle_command(command)\n' +
++'print(json.dumps({"pending":r.store.pending_count(),"checkpoint":r.store.checkpoint(sys.argv[3]) if len(sys.argv)>3 else None}))\n' +
++'r.store.close()\n';
++async function python(config: string, mode: string, device = '', input = '') {
++  return new Promise<any>((resolvePromise, reject) => {
++    const child = execFile(process.env.PYTHON || 'python3', ['-c', pythonScript, config, mode, device],
++      { env: { ...process.env, PYTHONPATH: source }, timeout: 30000 }, (error, stdout, stderr) => {
++        if (error) reject(new Error('Python integration failed: ' + stderr));
++        else { try { resolvePromise(JSON.parse(stdout)); } catch (e) { reject(e); } }
++      });
++    child.stdin.end(input);
++  });
++}
++
++test('pairing is atomic, single-use and expiring; stored credentials are verifiers', async () => {
++  const code = await service.issuePairing(gym(), String(actor));
++  const results = await Promise.allSettled([1, 2].map(() => service.pair({ code: code.code, appVersion: 'test' })));
++  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
++  const stored = await collection('biometricpairings').findOne({ verifier: digest(code.code) });
++  assert.equal(stored.code, undefined);
++  const expired = await service.issuePairing(gym(), String(actor));
++  await collection('biometricpairings').updateOne({ verifier: digest(expired.code) }, { $set: { expiresAt: new Date(0) } });
++  await assert.rejects(service.pair({ code: expired.code, appVersion: 'test' }));
++  const installed = await installation();
++  assert.notEqual(installed.connector.credentialVerifier, installed.pair.credential);
++  await assert.rejects(service.token({ ...installed.pair, credential: 'f'.repeat(64) }));
++});
++
++test('scopes reject cross-gym reads, device assignments and member references', async () => {
++  const installed = await installation();
++  await assert.rejects(service.gym({ userId: String(actor), role: 'gym_owner', tenantId: String(tenantA) }, String(gymB)));
++  await assert.rejects(service.gym({ userId: String(actor), role: 'gym_staff', tenantId: String(tenantA), gymId: String(gymB) }, String(gymA)));
++  await assert.rejects(service.gym({ userId: String(actor), role: 'member', tenantId: String(tenantA), gymId: String(gymA) }, String(gymA)));
++  await assert.rejects(service.addDevice({ _id: gymB, tenantId: tenantB }, String(actor), { connectorId: installed.pair.connectorId,
++    adapter: 'simulator', ip: '127.0.0.1', port: 4370, timezone: 'Asia/Kolkata', historySince: new Date(Date.now() - 86400000).toISOString() }));
++});
++
++test('real Python connector survives lost acknowledgement and restart; unknown users resolve explicitly', async () => {
++  const configPath = join(temporary, 'config.json'), fixture = join(temporary, 'simulator.json');
++  await writeFile(configPath, JSON.stringify({ api_url: base, state_dir: temporary, development: true, simulator_file: fixture }));
++  const now = new Date().toISOString();
++  await writeFile(fixture, JSON.stringify({ devices: { '4370': { identity: 'SIM-INTEGRATION', generation: 'gen-1', users: ['1001'],
++    events: [{ index: 1, deviceUserId: '1001', timestamp: now, eventType: 'check-in' }] } } }));
++  const pairing = await service.issuePairing(gym(), String(actor));
++  await python(configPath, 'pair', '', pairing.code);
++  const connectors = await collection('biometricconnectors').find({ gymId: gymA }).sort({ createdAt: -1 }).toArray();
++  const connector = connectors[0];
++  const assigned = await service.addDevice(gym(), String(actor), { connectorId: String(connector._id), adapter: 'simulator', ip: '127.0.0.1', port: 4370,
++    timezone: 'Asia/Kolkata', historySince: new Date(Date.now() - 86400000).toISOString() });
++  const deviceId = assigned.deviceId;
++  const lost = await python(configPath, 'lost-ack', deviceId);
++  assert.equal(lost.pending, 1);
++  assert.equal(lost.checkpoint, null);
++  assert.equal(await collection('biometricevents').countDocuments({ deviceId: new Types.ObjectId(deviceId) }), 1);
++  assert.equal(await collection('attendances').countDocuments(), 0);
++  const recovered = await python(configPath, 'sync', deviceId);
++  assert.equal(recovered.pending, 0);
++  assert.equal(recovered.checkpoint.position, '1');
++  assert.equal(await collection('biometricevents').countDocuments({ deviceId: new Types.ObjectId(deviceId) }), 1);
++  const status = await service.status(gym());
++  assert.ok(status.connectors.find(c => String(c._id) === String(connector._id)).online);
++  assert.equal(status.unresolved.length, 1);
++  const memberId = id(), mappingId = id(), userId = id();
++  await collection('members').insertOne({ _id: memberId, userId, userGymMappingId: mappingId, isActive: true });
++  await collection('usergymmappings').insertOne({ _id: mappingId, userId, tenantId: tenantA, gymId: gymA, isActive: true });
++  await service.map(gym(), String(actor), deviceId, { deviceUserId: '1001', memberId: String(memberId) });
++  await service.map(gym(), String(actor), deviceId, { deviceUserId: '1001', memberId: String(memberId) });
++  assert.equal(await collection('attendances').countDocuments({ memberId }), 1);
++  const outsider = id(), outsiderMap = id();
++  await collection('members').insertOne({ _id: outsider, userId, userGymMappingId: outsiderMap, isActive: true });
++  await collection('usergymmappings').insertOne({ _id: outsiderMap, userId, tenantId: tenantB, gymId: gymB, isActive: true });
++  await assert.rejects(service.map(gym(), String(actor), deviceId, { deviceUserId: 'other', memberId: String(outsider) }));
++  const attendanceScope = Object.create(AttendanceService.prototype) as any;
++  assert.equal((await collection('attendances').aggregate(attendanceScope.buildScopeStages(String(gymB), String(tenantB))).toArray()).length, 0);
++  assert.equal((await collection('attendances').aggregate(attendanceScope.buildScopeStages(String(gymA), String(tenantA))).toArray()).length, 1);
++  const analyticsScope = Object.create(AnalyticsService.prototype) as any;
++  assert.equal((await collection('attendances').aggregate(analyticsScope.viaAttendanceUser({ gymIds: [gymB] })).toArray()).length, 0);
++  const earlier = await service.setAccess(gym(), String(actor), deviceId, String(memberId), { enabled: true });
++  const latest = await service.setAccess(gym(), String(actor), deviceId, String(memberId), { enabled: false });
++  assert.ok(latest.version > earlier.version);
++  await python(configPath, 'command', deviceId);
++  const desired = await collection('biometricaccess').findOne({ deviceId: new Types.ObjectId(deviceId) });
++  assert.equal(desired.enabled, false);
++  assert.equal(desired.confirmedVersion, latest.version);
++  assert.equal((await collection('biometriccommands').findOne({ _id: new Types.ObjectId(earlier.commandId) })).status, 'superseded');
++  assert.equal((await collection('biometriccommands').findOne({ _id: new Types.ObjectId(latest.commandId) })).status, 'succeeded');
++  // Reconciliation recovers even if the notification/command has expired.
++  const next = await service.setAccess(gym(), String(actor), deviceId, String(memberId), { enabled: true });
++  await collection('biometriccommands').updateOne({ _id: new Types.ObjectId(next.commandId) }, { $set: { status: 'expired' } });
++  await python(configPath, 'sync', deviceId);
++  assert.equal((await collection('biometricaccess').findOne({ _id: desired._id })).confirmedVersion, next.version);
++  // A live connector with no new scans still has successful communication/fetch.
++  assert.ok((await service.status(gym())).connectors.find(c => String(c._id) === String(connector._id)).health.lastAttendanceFetch);
++  const command = await service.queue(gym(), String(actor), deviceId, 'SYNC_ATTENDANCE');
++  await python(configPath, 'command', deviceId);
++  assert.equal((await collection('biometriccommands').findOne({ _id: new Types.ObjectId(command.commandId) })).result.count, 0);
++  // Saved identity recovers a simulator endpoint change without binding a different device.
++  const fixtureState = JSON.parse(await readFile(fixture, 'utf8'));
++  fixtureState.devices['5005'] = fixtureState.devices['4370'];
++  delete fixtureState.devices['4370'];
++  await writeFile(fixture, JSON.stringify(fixtureState));
++  await python(configPath, 'sync', deviceId);
++  assert.equal((await collection('biometricdevices').findOne({ _id: new Types.ObjectId(deviceId) })).port, 5005);
++  // Attendance remains usable when the separate access capability is unavailable.
++  fixtureState.devices['5005'].access = false;
++  fixtureState.devices['5005'].generation = 'gen-2';
++  await writeFile(fixture, JSON.stringify(fixtureState));
++  await python(configPath, 'sync', deviceId);
++  assert.equal(await collection('biometricevents').countDocuments({ deviceId: new Types.ObjectId(deviceId) }), 2);
++  assert.equal(await collection('attendances').countDocuments({ memberId }), 2);
++  assert.ok((await collection('biometriccheckpoints').findOne({ deviceId: new Types.ObjectId(deviceId), generation: 'gen-2' })).dataGap);
++  assert.equal((await collection('biometricdevices').findOne({ _id: new Types.ObjectId(deviceId) })).capabilities.access, false);
++});
++
++test('leases recover after crashes; receipt acknowledgement is not execution success', async () => {
++  const installed = await installation();
++  const commandId = id();
++  await collection('biometriccommands').insertOne({ _id: commandId, gymId: gymA, tenantId: tenantA, connectorId: installed.connector._id,
++    type: 'DISCOVER_DEVICES', payload: {}, status: 'pending', attempts: 0, nextAttempt: new Date(0), createdAt: new Date(), expiresAt: new Date(Date.now() + 60000) });
++  const first = (await service.commands(installed.connector, 0))[0];
++  await service.ack(installed.connector, String(commandId), first.leaseToken);
++  assert.equal((await collection('biometriccommands').findOne({ _id: commandId })).status, 'running');
++  await collection('biometriccommands').updateOne({ _id: commandId }, { $set: { leaseUntil: new Date(0) } });
++  const second = (await service.commands(installed.connector, 0))[0];
++  assert.notEqual(second.leaseToken, first.leaseToken);
++  await assert.rejects(service.result(installed.connector, String(commandId), { leaseToken: first.leaseToken, status: 'succeeded' }));
++  await service.result(installed.connector, String(commandId), { leaseToken: second.leaseToken, status: 'succeeded' });
++  assert.equal((await service.result(installed.connector, String(commandId), { leaseToken: second.leaseToken, status: 'succeeded' })).status, 'succeeded');
++});
++
++test('HTTP auth validates claims, rejects extra fields and enforces immediate revocation', async () => {
++  const installed = await installation();
++  const payload = { appVersion: 'test', pendingCount: 0 };
++  assert.equal((await http('POST', '/connectors/me/heartbeat', payload)).status, 401);
++  assert.equal((await http('POST', '/connectors/me/heartbeat', { ...payload, gymId: String(gymB) }, installed.token)).status, 400);
++  assert.equal((await http('POST', '/connectors/me/heartbeat', payload, installed.token)).status, 201);
++  const other = await installation();
++  assert.equal((await http('PUT', '/connectors/me/devices/' + new Types.ObjectId() + '/report',
++    { reachable: false, attendance: false, access: false, expiry: false }, other.token)).status, 404);
++  const rotated = await service.rotate(installed.connector);
++  await service.token(installed.pair); // old secret works only during recovery grace
++  await service.token(rotated);
++  await collection('biometricconnectors').updateOne({ _id: installed.connector._id }, { $set: { previousUntil: new Date(0) } });
++  await assert.rejects(service.token(installed.pair));
++  const pendingPoll = http('GET', '/connectors/me/commands?waitSeconds=5', undefined, installed.token);
++  await new Promise(resolve => setTimeout(resolve, 100));
++  await service.revoke(gym(), { role: 'gym_owner', userId: String(actor) }, installed.pair.connectorId);
++  assert.equal((await http('POST', '/connectors/me/heartbeat', payload, installed.token)).status, 401);
++  assert.equal((await pendingPoll).status, 401);
++  await assert.rejects(service.token(rotated));
++  const old = await installation();
++  await collection('biometricconnectors').updateOne({ _id: old.connector._id }, { $set: { lastHeartbeat: new Date(Date.now() - 181000) } });
++  assert.equal((await service.status(gym())).connectors.find(c => String(c._id) === String(old.connector._id)).online, false);
++  const status = JSON.stringify(await service.status(gym()));
++  assert.ok(!status.includes('credentialVerifier') && !status.includes(rotated.credential));
++  await assert.rejects(service.support(gym(), String(actor), false));
++});
+diff --git a/src/biometric/biometric.spec.ts b/src/biometric/biometric.spec.ts
+new file mode 100644
+index 0000000..d445648
+--- /dev/null
++++ b/src/biometric/biometric.spec.ts
+@@ -0,0 +1,43 @@
++import 'reflect-metadata';
++import * as assert from 'node:assert/strict';
++import { test } from 'node:test';
++import { plainToInstance } from 'class-transformer';
++import { validate } from 'class-validator';
++import { GUARDS_METADATA } from '@nestjs/common/constants';
++import { IS_PUBLIC_KEY } from '../auth/decorators/public.decorator';
++import { ConnectorController, ConnectorRegistrationController, BiometricAdminController } from './biometric.controller';
++import { ConnectorGuard } from './connector.guard';
++import { BatchDto, PairDto, DeviceDto } from './biometric.dto';
++import { biometricSchemas } from './biometric.schemas';
++import { eventIdentity } from './biometric.service';
++
++test('connector routes bypass human JWT only behind the connector guard', () => {
++  assert.equal(Reflect.getMetadata(IS_PUBLIC_KEY, ConnectorController), true);
++  assert.deepEqual(Reflect.getMetadata(GUARDS_METADATA, ConnectorController), [ConnectorGuard]);
++  assert.equal(Reflect.getMetadata(IS_PUBLIC_KEY, BiometricAdminController), undefined);
++  assert.equal(Reflect.getMetadata(IS_PUBLIC_KEY, ConnectorRegistrationController.prototype.pair), true);
++});
++
++test('strict nested batches reject extra ownership fields and biometric templates', async () => {
++  const dto = plainToInstance(BatchDto, { deviceId: 'a'.repeat(24), generation: 'g', position: '1', dataGap: false,
++    gymId: 'b'.repeat(24), events: [{ eventId: 'c'.repeat(64), nativeId: '1', deviceUserId: '1001',
++      occurredAt: new Date().toISOString(), rawTimestamp: 'raw', timezone: 'Asia/Kolkata', eventType: 'check-in', fingerprint: 'no' }] });
++  const errors = await validate(dto, { whitelist: true, forbidNonWhitelisted: true });
++  assert.ok(errors.some(e => e.property === 'gymId'));
++  assert.ok(errors.some(e => e.property === 'events' && e.children?.length));
++  assert.ok((await validate(plainToInstance(PairDto, { code: '123', appVersion: '0.1.0' }))).length);
++  assert.ok((await validate(plainToInstance(DeviceDto, { connectorId: 'a'.repeat(24), adapter: 'unverified-hardware',
++    ip: '192.168.1.2', port: 4370, timezone: 'UTC', historySince: new Date().toISOString() }))).length);
++});
++
++test('event identity partitions native IDs by device and generation', () => {
++  assert.equal(eventIdentity('d', 'g', '1'), 'ef2ca68513652569a386f0577b48b670f93c93dfbcf1116a52259ecd4f95aa52');
++  assert.notEqual(eventIdentity('d', 'g', '1'), eventIdentity('d', 'g2', '1'));
++  assert.notEqual(eventIdentity('d', 'g', '1'), eventIdentity('other', 'g', '1'));
++  assert.match(eventIdentity('d', 'g', '1'), /^[a-f0-9]{64}$/);
++});
++
++test('critical ingestion and mapping indexes are unique', () => {
++  for (const name of ['BiometricEvent', 'BiometricMapping', 'BiometricAccess', 'BiometricCheckpoint'])
++    assert.ok(biometricSchemas[name].indexes().some(([, options]) => options.unique), name);
++});
