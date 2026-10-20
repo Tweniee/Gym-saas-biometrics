@@ -4,6 +4,8 @@ The Python connector lives directly in this repository: `pyproject.toml`, `src/`
 
 The setup flow is: super admin uploads the Windows installer through the backend → owner downloads it from the gym Biometrics page → owner generates a five-minute pairing code → Windows app pairs with that gym → app discovers or accepts an Ethernet endpoint → reads serial number, users and attendance through a supported protocol → reports device readiness and acknowledged attendance uploads. Owners link enrolled device user IDs to gym members in the same admin page.
 
+**Pair app** establishes the server connection first: it securely saves the installation credential, verifies authenticated API access and sends a heartbeat without requiring a biometric device. A saved pairing survives TCP/device failures, temporary API outages and app restarts. The app retries with that credential and refreshes access tokens automatically; generate another pairing code only if the installation is unpaired or its authentication has been revoked. Cloud and device status are displayed separately.
+
 The hardware adapter targets **Identix / ZK-compatible TCP**, normally port 4370, using this repository's protocol implementation. It has protocol-emulator tests; no physical model/firmware is certified yet. Attendance is read-only. Door access writes and expiry enforcement are unsupported for this adapter. Unsupported layouts/protocols fail visibly.
 
 No email is drafted or sent on setup failure. The owner sees retry guidance and diagnostics and can contact **support@thezenvore.com**.

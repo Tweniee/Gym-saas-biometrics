@@ -10,6 +10,7 @@ from . import __version__
 from .adapters import adapter_for
 from .auth import CredentialStore
 from .discovery import interfaces
+from .pairing import ServerConnection
 from .runtime import error_code
 from .sync import utc_now
 
@@ -50,6 +51,8 @@ def show(runtime, config_path=None):
     code.grid(row=8, column=0, columnspan=2, sticky="ew", pady=8)
     messages = queue.Queue()
     busy = False
+    server = ServerConnection(runtime)
+    pairing_required = True
     closed = threading.Event()
     def work(kind, action):
         def execute():
@@ -60,22 +63,25 @@ def show(runtime, config_path=None):
         threading.Thread(target=execute, daemon=True).start()
     def pair():
         nonlocal busy
-        if busy:
+        if busy or polling:
             return
         value = code.get().strip()
-        code.delete(0, "end")
+        if pairing_required and not value:
+            note.set("Enter the 5-minute pairing code from your gym's Biometrics page.")
+            return
         busy = True
-        note.set("Pairing with your gym…")
-        work("pair", lambda: runtime.cloud.pair(value))
-    ttk.Button(frame, text="Pair app", command=pair).grid(row=8, column=2, padx=(12, 0))
+        pair_button.configure(state="disabled")
+        note.set("Pairing with your gym…" if pairing_required else "Reconnecting with your saved pairing…")
+        work("pair", lambda: server.pair(value))
+    pair_button = ttk.Button(frame, text="Pair app", command=pair)
+    pair_button.grid(row=8, column=2, padx=(12, 0))
     ttk.Label(frame, text="2. Find your Ethernet device", font=(native_font, 12, "bold")).grid(row=9, column=0, columnspan=3, sticky="w", pady=(14, 6))
-    nics = interfaces()
-    choices = [i["name"] + " · " + i["address"] for i in nics]
+    # Enumerate local interfaces only after the server pairing is established.
+    nics = []
+    choices = []
     nic = ttk.Combobox(frame, state="readonly", values=choices)
     nic.grid(row=10, column=0, columnspan=2, sticky="ew")
-    preferred = next((i for i, item in enumerate(nics) if item["selectedByDefault"]), None)
-    if preferred is not None:
-        nic.current(preferred)
+    preferred = None
     candidates = []
     candidate = ttk.Combobox(frame, state="readonly")
     candidate.grid(row=11, column=0, columnspan=3, sticky="ew", pady=8)
@@ -117,7 +123,7 @@ def show(runtime, config_path=None):
     policy = ttk.Combobox(frame, state="readonly", values=["Every scan is check-in", "ZK codes: 0 in / 1 out", "Retain without attendance"])
     policy.current(0)
     policy.grid(row=16, column=2, sticky="ew")
-    note = tk.StringVar(value="Connect the computer and biometric device to the same network.")
+    note = tk.StringVar(value="Pair with the server first. You can connect the biometric device later.")
     ttk.Label(frame, textvariable=note, wraplength=720).grid(row=18, column=0, columnspan=3, sticky="w", pady=12)
     def connect():
         nonlocal busy
@@ -180,30 +186,52 @@ def show(runtime, config_path=None):
         ttk.Button(frame, text="Enable background sync", command=lambda: service_action(True)).grid(row=21, column=0, sticky="w", pady=8)
         ttk.Button(frame, text="Disable background sync", command=lambda: service_action(False)).grid(row=21, column=1, sticky="w", pady=8)
     polling = False
+    device_polling = False
     auto_scanned = False
+    def server_status(result):
+        nonlocal pairing_required, device_polling
+        pairing_required = result.needs_pairing
+        pair_button.configure(text="Pair app" if pairing_required else "Retry server connection", state="normal")
+        code.configure(state="normal" if pairing_required else "disabled")
+        if result.paired and not pairing_required:
+            code.configure(state="normal")
+            code.delete(0, "end")
+            code.configure(state="disabled")
+        if result.setup is not None:
+            cloud_status.set("Cloud: connected · " + (result.setup.get("gymName") or result.setup["gymId"]) + " · Pairing saved securely")
+            if not device_polling and not busy:
+                device_polling = True
+                work("status", lambda: (runtime.cloud.request("GET", "/connectors/me/devices"), interfaces()))
+        elif pairing_required:
+            cloud_status.set("Cloud: pairing required" + (" (" + result.error + ")" if result.error else ""))
+        else:
+            cloud_status.set("Cloud: pairing saved · Reconnecting (" + result.error + "). No new pairing code needed.")
     def refresh():
         nonlocal polling
         if not closed.is_set() and not polling and not busy:
             polling = True
-            def status():
-                setup = runtime.cloud.request("GET", "/connectors/me/setup")
-                devices = runtime.cloud.request("GET", "/connectors/me/devices")
-                return setup, devices, interfaces()
-            work("status", status)
+            pair_button.configure(state="disabled")
+            work("server", server.check)
         if not closed.is_set():
             root.after(5000, refresh)
     def poll():
-        nonlocal busy, polling, candidates, auto_scanned, nics, choices, preferred
+        nonlocal busy, polling, device_polling, candidates, auto_scanned, nics, choices, preferred
         try:
             while True:
                 kind, result, error = messages.get_nowait()
-                if kind == "status":
+                if kind == "server":
                     polling = False
                     if error:
-                        cloud_status.set("Cloud: not connected (" + error + "). Pair or check internet access.")
+                        pair_button.configure(state="normal")
+                        cloud_status.set("Cloud: secure pairing could not be checked (" + error + "). Unlock credential storage and retry.")
+                    else:
+                        server_status(result)
+                elif kind == "status":
+                    device_polling = False
+                    if error:
                         device_status.set("Device: current status unavailable")
                     else:
-                        setup, devices, active_nics = result
+                        devices, active_nics = result
                         if active_nics != nics:
                             old = nic.get()
                             nics = active_nics
@@ -217,25 +245,23 @@ def show(runtime, config_path=None):
                             else:
                                 nic.set("")
                             auto_scanned = False
-                        cloud_status.set("Cloud: connected · " + (setup.get("gymName") or setup["gymId"]))
                         fresh = [d for d in devices if d.get("report", {}).get("reachable") and d["report"].get("receivedAt") and
                                  (datetime.now(timezone.utc) - datetime.fromisoformat(d["report"]["receivedAt"].replace("Z", "+00:00"))).total_seconds() < 180]
                         device_status.set("Device: connection ready · " + fresh[0]["identity"] if fresh else "Device: waiting for a successful data read")
-                        heartbeat = runtime.store.get("lastHeartbeat")
                         health = runtime.store.get("health", {})
                         synced = health.get("lastAcknowledgedUpload")
                         sync_status.set(("Attendance: last cloud acknowledgement " + synced if synced else "Attendance: no acknowledged upload yet") + (" · History gap detected" if health.get("errorCode") == "DATA_GAP" else ""))
-                        if heartbeat:
-                            cloud_status.set(cloud_status.get() + " · Service heartbeat " + heartbeat)
                         if not devices and not auto_scanned and preferred is not None:
                             auto_scanned = True
                             scan()
                 else:
                     busy = False
+                    if kind == "pair":
+                        pair_button.configure(state="normal")
                     if error and kind == "service":
                         note.set("Background sync could not be changed. Open the app from Applications, check System Settings → General → Login Items, and retry (" + error + ").")
                     elif error:
-                        note.set(("Pairing failed (" + error + "). Check internet access and generate a fresh 5-minute code." if kind == "pair" else "Setup did not complete (" + error + "). Check Ethernet, IP/port and communication key, then retry. Contact " + SUPPORT + " if needed."))
+                        note.set(("Server pairing could not complete (" + error + "). Check internet access and secure credential storage, then retry. A saved pairing is retained." if kind == "pair" else "Setup did not complete (" + error + "). Check Ethernet, IP/port and communication key, then retry. Contact " + SUPPORT + " if needed."))
                         diagnostics.configure(state="normal"); diagnostics.delete("1.0", "end")
                         diagnostics.insert("1.0", json.dumps({"time": utc_now(), "appVersion": __version__, "operation": kind, "errorCode": error,
                                                           "ip": ip.get(), "port": port.get(), "timezone": zone.get()}, indent=2))
@@ -243,7 +269,13 @@ def show(runtime, config_path=None):
                     elif kind == "service":
                         note.set(result)
                     elif kind == "pair":
-                        note.set("Paired successfully. Discover or enter your device below.")
+                        server_status(result)
+                        if result.setup is not None:
+                            note.set("Server connected and pairing saved securely. You can configure or fix the device TCP connection later.")
+                        elif result.needs_pairing:
+                            note.set("Server rejected authentication. Check the connector in Zenvore Admin before pairing again.")
+                        else:
+                            note.set("Pairing saved securely. The app will retry the server connection automatically; no new code is needed.")
                     elif kind == "scan":
                         candidates = result
                         candidate.configure(values=[d["identity"] + " · " + d["ip"] + ":" + str(d["port"]) for d in candidates])

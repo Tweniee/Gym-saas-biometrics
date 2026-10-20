@@ -33,6 +33,8 @@ The Intel command runs x86_64 Python, pip and PyInstaller through Rosetta and ex
 
 Open the DMG, drag **Zenvore Connector** to **Applications**, eject the DMG and launch the installed app. Generate the five-minute pairing code in the gym dashboard, pair, select Ethernet or enter IP/port, then **Verify and connect**. Identity, users and attendance must be read before reporting device readiness.
 
+**Pair app** connects to the server and saves its credential in Keychain before any device discovery. The app verifies authenticated API access and sends a heartbeat independently of the biometric device. If the API check temporarily fails after pairing, the app shows **pairing saved**, retries automatically and offers **Retry server connection** using the saved credential. TCP failures do not undo pairing. Reopening the app reconnects with Keychain credentials without another five-minute code.
+
 Click **Enable background sync** to register the per-user LaunchAgent. It continues after closing setup and starts at user login. Keep the Mac awake and logged in; this is not a system service that runs before login. macOS may request Local Network and Keychain access. If blocked, check System Settings → Privacy & Security → Local Network, and General → Login Items & Extensions.
 
 **Disable background sync** removes only the LaunchAgent. Disable it before moving or deleting the app. Pairing and attendance recovery data are retained; revoke the connector in Zenvore before retiring the Mac.

@@ -57,10 +57,13 @@ class Cloud:
             raise CloudError("CLOUD_SERVER", 502) from None
 
     def pair(self, code):
-        result = self.raw("POST", "/connectors/pair", {"code": code.strip().upper(), "appVersion": __version__})
-        self.credentials.save(result)
-        self.token, self.expires = None, 0
-        return result["connectorId"]
+        with self.lock:
+            result = self.raw("POST", "/connectors/pair", {"code": code.strip().upper(), "appVersion": __version__})
+            self.credentials.save(result)
+            self.token, self.expires = None, 0
+            self.installation = None
+            self.rotate_needed = False
+            return result["connectorId"]
 
     def access_token(self):
         with self.lock:
