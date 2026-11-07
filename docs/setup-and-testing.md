@@ -27,7 +27,7 @@ The manual GitHub Actions workflow can also produce the artifact. It does not pu
 2. Download the Windows app. Install it with administrator privileges on a computer on the device's Ethernet network.
 3. On the admin page, generate a pairing code. Enter it in **Connector Setup** within five minutes. Codes are single-use; generating another invalidates the earlier unused code.
 4. The app checks cloud authentication and scans an active Ethernet interface after pairing. Select the intended interface and use **Scan Ethernet** to retry. Scans use TCP 4370, one private network, and at most 256 addresses. A wider interface subnet is limited to its local /24. Select a candidate explicitly; the first candidate is not automatically assigned.
-5. Alternatively enter the device's private IPv4 address and configured TCP port. Enter its numeric communication key locally, if required; it is protected with machine DPAPI and never sent to the backend.
+5. Alternatively enter the device's private IPv4 address and configured TCP port. Enter its numeric communication key locally, if required; it is protected with machine DPAPI and never sent to the backend. The communication key is the number under the device menu **COMM → Comm Key** (often `0` = none). UDP-only devices are not discovered automatically; enter them manually by IP.
 6. Confirm the device's IANA timezone, initial history (today/7/30 days), and scan interpretation. **Every scan is check-in** treats scans as arrivals; **ZK codes 0 in / 1 out** requires those device semantics; **Retain without attendance** preserves raw events only. Timezone/history/policy are fixed for a device assignment.
 7. Choose **Verify and connect**. The app must read a stable serial, size/user data and a recognized attendance layout. Then it registers the device using its connector-scoped identity and performs an initial upload.
 8. The app and admin page report cloud pairing, device reads and acknowledged sync independently. A TCP socket, pairing code or received command alone never proves attendance success.
@@ -37,7 +37,7 @@ The manual GitHub Actions workflow can also produce the artifact. It does not pu
 ## Failure checks
 
 - Stop the Windows service: its server heartbeat becomes offline after the configured freshness window (default 180 seconds).
-- Unplug device Ethernet: the next read reports unavailable; cloud pairing stays distinct. Reconnect and use **Test** or wait for scheduled retry.
+- Unplug device Ethernet: the next read reports unavailable; cloud pairing stays distinct. Reconnect, then re-run **Verify and connect** in the setup app or wait for the scheduled retry (sync interval, default 60 s).
 - Enter a wrong communication key or use an unrelated TCP service: setup fails without reporting connection ready.
 - Expire/reuse a pairing code: pairing is rejected. Generate a new one.
 - Disable internet after a staged upload: the exact pending batch survives restart and retries without duplicate attendance.

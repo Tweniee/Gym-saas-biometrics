@@ -6,7 +6,7 @@ The setup flow is: super admin uploads the Windows installer through the backend
 
 **Pair app** establishes the server connection first: it securely saves the installation credential, verifies authenticated API access and sends a heartbeat without requiring a biometric device. A saved pairing survives TCP/device failures, temporary API outages and app restarts. The app retries with that credential and refreshes access tokens automatically; generate another pairing code only if the installation is unpaired or its authentication has been revoked. Cloud and device status are displayed separately.
 
-The hardware adapter targets **Identix / ZK-compatible TCP**, normally port 4370, using this repository's protocol implementation. It has protocol-emulator tests; no physical model/firmware is certified yet. Attendance is read-only. Door access writes and expiry enforcement are unsupported for this adapter. Unsupported layouts/protocols fail visibly.
+The hardware adapter targets **Identix / ZK-compatible TCP**, normally port 4370, using this repository's protocol implementation. It has protocol-emulator tests; no physical model/firmware is certified yet. Attendance is read-only. Door access writes and expiry enforcement are unsupported for this adapter. Unsupported layouts/protocols fail visibly; individual undecodable records are skipped and counted in the log (see [protocol](docs/protocol.md)).
 
 No email is drafted or sent on setup failure. The owner sees retry guidance and diagnostics and can contact **support@thezenvore.com**.
 
@@ -25,7 +25,7 @@ zenvore-connector --config .dev/config.json run
 
 Enter the code at the hidden prompt. On Windows use `.venv\Scripts\Activate.ps1` and `python`. Simulator development requires a loopback backend. Production uses HTTPS and Windows machine DPAPI plus restricted ProgramData ACLs; credentials and communication keys are never stored by Angular.
 
-`setup` opens the Windows setup wizard. `interfaces` lists active IPv4 interfaces without scanning. `diagnostics` prints allowlisted health counters. The installed service runs independently of the setup window.
+`setup` opens the setup wizard (Windows and macOS). `interfaces` lists active IPv4 interfaces without scanning. `diagnostics` prints allowlisted health counters. The installed service runs independently of the setup window.
 
 ## Verify and release
 

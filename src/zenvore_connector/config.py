@@ -23,7 +23,8 @@ class Config:
     simulator_file: Path | None = None
     heartbeat_seconds: int = 60
     sync_seconds: int = 60
-    timeout_seconds: int = 15
+    timeout_seconds: int = 15  # Cloud HTTP requests.
+    device_timeout_seconds: int = 15  # Each socket operation of a device session (separate: slow LANs need more).
 
     def __post_init__(self):
         url = urlsplit(self.api_url)
@@ -38,12 +39,17 @@ class Config:
             raise ValueError("The simulator requires explicit development mode")
         if not (5 <= self.heartbeat_seconds <= 300 and 5 <= self.sync_seconds <= 300 and 1 <= self.timeout_seconds <= 30):
             raise ValueError("Intervals or timeout outside permitted bounds")
+        if not 1 <= self.device_timeout_seconds <= 60:
+            raise ValueError("Device timeout outside permitted bounds")
 
     @classmethod
     def load(cls, file: Path) -> "Config":
         data = json.loads(file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("the settings file must contain a JSON object")
         return cls(api_url=data["api_url"].rstrip("/"), state_dir=Path(data.get("state_dir", file.parent)).expanduser().resolve(),
                    development=data.get("development", False),
                    simulator_file=Path(data["simulator_file"]).expanduser().resolve() if data.get("simulator_file") else None,
                    heartbeat_seconds=data.get("heartbeat_seconds", 60), sync_seconds=data.get("sync_seconds", 60),
-                   timeout_seconds=data.get("timeout_seconds", 15))
+                   timeout_seconds=data.get("timeout_seconds", 15),
+                   device_timeout_seconds=data.get("device_timeout_seconds", 15))

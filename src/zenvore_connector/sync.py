@@ -92,6 +92,8 @@ class Sync:
 
 class ProcessDeviceLock:
     """Coordinate the elevated setup app and LocalSystem service on Windows."""
+    WAIT = 5  # Seconds a blocking acquire waits while another process holds the device.
+
     def __init__(self, directory, name):
         from pathlib import Path
         self.path = Path(directory) / ("device-" + hashlib.sha256(name.encode()).hexdigest()[:32] + ".lock")
@@ -112,7 +114,7 @@ class ProcessDeviceLock:
         except BaseException:
             self.local.release()
             raise
-        deadline = time.monotonic() + (5 if blocking else 0)
+        deadline = time.monotonic() + (self.WAIT if blocking else 0)
         try:
             while True:
                 try:
@@ -147,7 +149,8 @@ class ProcessDeviceLock:
 
     def __enter__(self):
         if not self.acquire():
-            raise AdapterError("DEVICE_UNREACHABLE", True)
+            # The cloud code stays DEVICE_UNREACHABLE (the backend whitelists codes); the reason is local.
+            raise AdapterError("DEVICE_UNREACHABLE", True, reason="DEVICE_BUSY")
         return self
 
     def __exit__(self, *_):

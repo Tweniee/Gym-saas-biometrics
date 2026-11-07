@@ -33,21 +33,37 @@ class Runtime:
         self.network_signature = None
         self.last_discovery = 0
 
+    def interrupted(self, exc):
+        """A shutdown, or a session the shutdown cut short, is not a device outage."""
+        return self.stop.is_set() or (isinstance(exc, AdapterError) and exc.reason == "CANCELLED")
+
+    @staticmethod
+    def busy(exc):
+        """Another process holds the device lock. The device was never contacted, so it is not unreachable."""
+        return isinstance(exc, AdapterError) and exc.reason == "DEVICE_BUSY"
+
     def failure(self, exc):
+        if self.busy(exc):
+            # Skipped for this cycle; the next one retries. Not an outage, so no stored errorCode. The cloud
+            # still sees DEVICE_UNREACHABLE, so say why locally (no ids or secrets).
+            LOG.info("device_busy")
+            return
+        if self.interrupted(exc):
+            return  # Neither a stored errorCode nor a log line: the next start simply begins again.
         code = error_code(exc)
         self.health.update(errorCode=code)
         # Never log exception text, HTTP bodies, user IDs or credentials.
         LOG.warning("operation_failed code=%s", code)
 
     def handshake(self, device):
-        adapter = adapter_for(device, self.config, self.store)
+        adapter = adapter_for(device, self.config, self.store, self.stop.is_set)
         expected = device.get("identity") or self.store.get("identity:" + device["_id"])
         rediscovered = False
         try:
             identity = adapter.health()
         except AdapterError as exc:
-            if exc.code != "DEVICE_UNREACHABLE" or not expected:
-                raise
+            if exc.code != "DEVICE_UNREACHABLE" or not expected or self.interrupted(exc) or self.busy(exc):
+                raise  # A cancel must not start a /24 scan that nothing can interrupt; a busy device is not gone.
             if device.get("adapter") == "simulator":
                 candidates = simulator_candidates(self.config, self.store)
             else:
@@ -56,7 +72,7 @@ class Runtime:
             if len(matches) != 1:
                 raise
             device.update(ip=matches[0]["ip"], port=matches[0]["port"])
-            adapter = adapter_for(device, self.config, self.store)
+            adapter = adapter_for(device, self.config, self.store, self.stop.is_set)
             identity = adapter.health()
             rediscovered = True
         if expected and expected != identity:
@@ -71,7 +87,7 @@ class Runtime:
         return adapter
 
     def unreachable(self, device, exc):
-        if not isinstance(exc, AdapterError):
+        if not isinstance(exc, AdapterError) or self.interrupted(exc) or self.busy(exc):
             return
         try:
             self.cloud.request("PUT", "/connectors/me/devices/" + device["_id"] + "/report", {
@@ -112,7 +128,7 @@ class Runtime:
         # A cloud-authenticated assignment fetch gates device work: no offline management.
         devices = self.cloud.request("GET", "/connectors/me/devices")
         signature = tuple(sorted((i["name"], i["address"]) for i in interfaces() if i["selectedByDefault"]))
-        if signature != self.network_signature or (not devices and time.monotonic() - self.last_discovery >= 60):
+        if not self.stop.is_set() and (signature != self.network_signature or (not devices and time.monotonic() - self.last_discovery >= 60)):
             self.network_signature = signature
             self.store.set("discovered", self.discover())
         for device in devices:
@@ -206,6 +222,11 @@ class Runtime:
                 try:
                     result = self.execute(command)
                 except Exception as exc:
+                    if self.interrupted(exc):
+                        # Shutdown cut the command off. Post nothing and store no receipt: the lease
+                        # (120 s) expires and the cloud leases the command again (up to three attempts),
+                        # so it runs after the restart instead of being finalised as a device failure.
+                        return
                     self.failure(exc)
                     result = {"status": "failed", "errorCode": error_code(exc), "transient": bool(getattr(exc, "transient", False))}
                     # Cloud failures do not imply a device failure. Leave the lease

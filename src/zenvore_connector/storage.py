@@ -28,7 +28,7 @@ class Store:
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=FULL;
             PRAGMA busy_timeout=5000;
-            PRAGMA max_page_count=65536;
+            PRAGMA max_page_count=262144;
             CREATE TABLE IF NOT EXISTS seen_events(device TEXT, generation TEXT, native TEXT, PRIMARY KEY(device,generation,native));
             CREATE TABLE IF NOT EXISTS checkpoints(device TEXT PRIMARY KEY, generation TEXT, position TEXT);
             CREATE TABLE IF NOT EXISTS pending(device TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -96,6 +96,23 @@ class Store:
     def set(self, key, value):
         with self.transaction() as db:
             db.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", (key, json.dumps(value)))
+
+    def skipped_totals(self, devices=None):
+        """Local-only (orphans, undecodable) totals of the last ZK read of each device, or of `devices`."""
+        with self.lock:
+            rows = self.db.execute("SELECT key, value FROM metadata WHERE substr(key, 1, 11) = 'zk-skipped:'").fetchall()
+        wanted = None if devices is None else {"zk-skipped:" + d for d in devices}
+        orphans = undecodable = 0
+        for key, value in rows:
+            if wanted is not None and key not in wanted:
+                continue
+            try:
+                entry = json.loads(value)
+                orphans += int(entry.get("orphans", 0))
+                undecodable += int(entry.get("undecodable", 0))
+            except (ValueError, TypeError, AttributeError):
+                continue
+        return orphans, undecodable
 
     def completion(self, command):
         with self.lock:

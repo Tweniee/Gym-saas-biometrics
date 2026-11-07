@@ -59,9 +59,12 @@ def build(config):
 
 def diagnostics(runtime):
     health = runtime.health.snapshot()
+    orphans, undecodable = runtime.store.skipped_totals()
     return {"version": __import__('zenvore_connector').__version__, "paired": runtime.cloud.credentials.path.exists(),
             "pendingCount": runtime.store.pending_count(), "lastHeartbeat": runtime.store.get("lastHeartbeat"),
-            "errorCode": health.get("errorCode"), "platform": sys.platform}
+            "errorCode": health.get("errorCode"), "platform": sys.platform,
+            # Printed locally only; never part of a heartbeat or report payload.
+            "skippedRecords": {"orphans": orphans, "undecodable": undecodable}}
 
 
 def main(argv=None):
@@ -90,7 +93,15 @@ def main(argv=None):
                 "reachable": True, "access": True, "expiry": True, "users": ["1001"], "events": []}}}, indent=2).encode())
         print("Development configuration created. Simulator only; no hardware connection.")
         return 0
-    config = Config.load(args.config)
+    try:
+        config = Config.load(args.config)
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError, TypeError, AttributeError, OSError) as exc:
+        reason = "file not found" if isinstance(exc, FileNotFoundError) else (
+            "invalid JSON" if isinstance(exc, json.JSONDecodeError) else
+            "missing setting " + str(exc) if isinstance(exc, KeyError) else
+            "invalid settings (" + str(exc) + ")" if isinstance(exc, (ValueError, TypeError)) else "unreadable")
+        print("Config error: " + str(args.config) + ": " + reason + ". Run init-dev or reinstall.", file=sys.stderr)
+        return 2
     handler = configure_logging(config.state_dir)
     runtime = build(config)
     lock = None

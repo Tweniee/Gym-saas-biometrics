@@ -4,9 +4,10 @@ from dataclasses import dataclass
 
 
 class AdapterError(Exception):
-    def __init__(self, code, transient=False):
+    def __init__(self, code, transient=False, reason=None):
         super().__init__(code)
-        self.code, self.transient = code, transient
+        # `code` is whitelisted by the cloud and never changes; `reason` is local-only detail for the UI.
+        self.code, self.transient, self.reason = code, transient, reason
 
 
 @dataclass(frozen=True)

@@ -19,6 +19,7 @@ from zenvore_connector.config import Config
 from zenvore_connector.health import Health
 from zenvore_connector.storage import Store
 from zenvore_connector.sync import DeviceLocks, Sync
+from zk_emulator import checksum
 
 
 def stamp(year=2026, month=10, day=19, hour=14, minute=0, second=0):
@@ -44,14 +45,23 @@ class DeviceHandler(socketserver.BaseRequestHandler):
             data += part
         return data
 
+    @staticmethod
+    def packet(code, session, reply, data):
+        header = struct.pack("<4H", code, 0, session, reply)
+        body = struct.pack("<4H", code, checksum(header + data), session, reply) + data
+        return MAGIC + struct.pack("<I", len(body)) + body
+
     def handle(self):
         try:
             while True:
                 header = self.exact(8)
                 size = struct.unpack("<I", header[4:])[0]
                 request = self.exact(size)
-                command, _, _, reply = struct.unpack("<4H", request[:8])
+                command, check, session, reply = struct.unpack("<4H", request[:8])
                 self.server.commands.append(command)
+                if check != checksum(struct.pack("<4H", command, 0, session, reply) + request[8:]):
+                    self.server.bad_checksums += 1
+                    continue  # Validating firmware silently drops a corrupt packet.
                 code, data = 2000, b""
                 if command == 11:
                     data = b"~SerialNumber=DEVICE-001\0"
@@ -77,14 +87,12 @@ class DeviceHandler(socketserver.BaseRequestHandler):
                     offset, length = struct.unpack("<ii", request[8:])
                     chunk = self.transfer[offset:offset + length]
                     for extra_code, extra_data in ((1500, struct.pack("<I", len(chunk))), (1501, chunk[:5]), (1501, chunk[5:]), (2000, b"")):
-                        packet = struct.pack("<4H", extra_code, 0, 10, reply) + extra_data
-                        self.request.sendall(MAGIC + struct.pack("<I", len(packet)) + packet)
+                        self.request.sendall(self.packet(extra_code, 10, reply, extra_data))
                     continue
                 elif command not in (1000, 1001, 1502):
                     code = 2001
-                packet = struct.pack("<4H", code, 0, 10, reply) + data
+                packet = self.packet(code, 10, reply, data)
                 # Real TCP fragmentation must not corrupt framing.
-                packet = MAGIC + struct.pack("<I", len(packet)) + packet
                 self.request.sendall(packet[:5]); self.request.sendall(packet[5:])
                 if command == 1001:
                     return
@@ -105,6 +113,7 @@ class ZKTests(unittest.TestCase):
         self.config = Config("http://127.0.0.1:3000/api/v1", self.directory, True)
         self.server = DeviceServer(("127.0.0.1", 0), DeviceHandler)
         self.server.commands = []
+        self.server.bad_checksums = 0
         self.server.records = [attendance()]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -115,6 +124,7 @@ class ZKTests(unittest.TestCase):
     def tearDown(self):
         self.server.shutdown(); self.server.server_close(); self.thread.join()
         self.store.close(); self.temp.cleanup()
+        self.assertEqual(self.server.bad_checksums, 0)
 
     def test_handshake_reads_identity_users_and_attendance_without_writes(self):
         adapter = ZKTcp(self.device, self.config, self.store)

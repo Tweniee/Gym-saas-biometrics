@@ -232,11 +232,12 @@ class Device:
             self.sock.settimeout(SOCKET_TIMEOUT)
 
     def _build(self, command, data=b""):
-        buf = struct.pack("<4H", command, 0, self.session_id, self.reply_id) + data
-        chk = checksum(buf)
         rid = self.reply_id + 1
         if rid >= 0xFFFF:
             rid -= 0xFFFF
+        # The checksum covers the packet exactly as sent (new reply id, chk=0).
+        buf = struct.pack("<4H", command, 0, self.session_id, rid) + data
+        chk = checksum(buf)
         pkt = struct.pack("<4H", command, chk, self.session_id, rid) + data
         return MAGIC + struct.pack("<I", len(pkt)) + pkt
 

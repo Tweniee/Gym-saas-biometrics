@@ -134,10 +134,10 @@ py identix_manager.py
 python3 identix_manager.py
 ```
 
-For this checkout on your Mac, you can use:
+From a checkout, for example:
 
 ```bash
-cd "/Users/dhirajsingh/Desktop/Github/Gym Saas/Gym-saas-biometrics"
+cd path/to/Gym-saas-biometrics
 python3 identix_manager.py
 ```
 

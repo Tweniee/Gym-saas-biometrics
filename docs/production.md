@@ -5,7 +5,7 @@ The connector supports a read-only ZK-compatible TCP adapter for compatible Iden
 Before a gym pilot:
 
 1. Test the exact device model/firmware on Ethernet, including its communication key, serial stability, user IDs, record layout and selected scan interpretation.
-2. Verify device wall time/timezone. Ambiguous/nonexistent DST timestamps are rejected; no clock correction or silent fold guess occurs.
+2. Verify device wall time/timezone. Records with ambiguous/nonexistent DST timestamps are skipped and counted in the log; no clock correction or silent fold guess occurs.
 3. Validate Windows installation, UAC, SYSTEM/Administrators ACL, machine DPAPI sharing, service startup, reboot, failure restart, upgrade, rollback and uninstall.
 4. Sign the setup/service executables and installer, verify signatures, measure resource usage, then upload the installer through the super-admin page. Only backend StorageService accesses R2. PE structure/SHA-256 checks do not verify a publisher signature.
 5. Run the backend index migration against a Mongo replica set before enabling pairing/ingestion/release publication.

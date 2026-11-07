@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import queue
+import socket
 import struct
 import tempfile
 import threading
@@ -165,6 +166,72 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(message[1], [{"user_id": "192.168.1.202"}])
         self.assertEqual(message[-1]["ip"], "192.168.1.202")
         self.assertTrue(out.empty())
+
+
+class ProtocolChecksumTests(unittest.TestCase):
+    # Real captured device packet: cmd 11, chk 0xef58, session 0xc0c5, reply 5, data "~OS\0".
+    CAPTURED = bytes.fromhex("0b0058efc5c005007e4f5300")
+
+    @staticmethod
+    def packet_ok(body):
+        """Strict-device check: ones'-complement checksum over the packet as sent."""
+        _cmd, chk, _sess, _rid = struct.unpack("<4H", body[:8])
+        return manager.checksum(body[:2] + b"\x00\x00" + body[4:]) == chk
+
+    def test_checksum_golden_vector(self):
+        zeroed = self.CAPTURED[:2] + b"\x00\x00" + self.CAPTURED[4:]
+        self.assertEqual(manager.checksum(zeroed), 0xEF58)
+        self.assertTrue(self.packet_ok(self.CAPTURED))
+
+    def test_first_connect_body_matches_reference_client(self):
+        device = manager.Device("192.168.1.201", 4370)
+        frame = device._build(manager.CMD_CONNECT)
+        self.assertEqual(frame[:4], manager.MAGIC)
+        self.assertEqual(struct.unpack("<I", frame[4:8])[0], len(frame) - 8)
+        self.assertEqual(frame[8:].hex(), "e80317fc00000000")
+
+    def test_built_packets_checksum_covers_sent_reply_id(self):
+        device = manager.Device("192.168.1.201", 4370)
+        device.session_id = 0xC0C5
+        for reply_id in (0, 4, 65533, 65534):
+            device.reply_id = reply_id
+            frame = device._build(11, b"~OS\x00")
+            self.assertTrue(self.packet_ok(frame[8:]), reply_id)
+
+    def test_connect_against_strict_loopback_device(self):
+        received = []
+
+        def serve(listener):
+            conn, _ = listener.accept()
+            with conn:
+                head = conn.recv(8)
+                size = struct.unpack("<I", head[4:])[0]
+                body = conn.recv(size)
+                received.append(self.packet_ok(body))
+                if not received[-1]:
+                    return  # strict device silently drops bad checksums
+                _cmd, _chk, _sess, rid = struct.unpack("<4H", body[:8])
+                reply = struct.pack("<4H", manager.CMD_ACK_OK, 0, 0x1234, rid)
+                reply = struct.pack("<4H", manager.CMD_ACK_OK,
+                                    manager.checksum(reply), 0x1234, rid)
+                conn.sendall(manager.MAGIC + struct.pack("<I", len(reply)) + reply)
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        thread = threading.Thread(target=serve, args=(listener,), daemon=True)
+        thread.start()
+        device = manager.Device("127.0.0.1", listener.getsockname()[1])
+        try:
+            with patch.object(manager, "SOCKET_TIMEOUT", 2):
+                device.connect()
+            self.assertEqual(received, [True])
+            self.assertEqual(device.session_id, 0x1234)
+        finally:
+            if device.sock:
+                device.sock.close()
+            thread.join(2)
+            listener.close()
 
 
 class StateAndLoggingTests(unittest.TestCase):

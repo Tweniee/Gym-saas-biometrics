@@ -11,10 +11,32 @@ from .adapters import adapter_for
 from .auth import CredentialStore
 from .discovery import interfaces
 from .pairing import ServerConnection
+from .adapters.base import AdapterError
 from .runtime import error_code
 from .sync import utc_now
 
 SUPPORT = "support@thezenvore.com"
+COMM_KEY_NOTE = ("The device rejected the communication key. Check the device menu (COMM → Comm Key / "
+                 "Communication Password) and enter the same number here, then retry. Contact " + SUPPORT + " if needed.")
+BUSY_NOTE = "Background sync is reading the device right now. Wait a minute and press Verify and connect again."
+
+
+def setup_failure_note(error, reason=None):
+    """Text for a failed setup step. `reason` is local-only detail; the cloud-facing `error` code is unchanged."""
+    if reason == "COMM_KEY_REJECTED":
+        return COMM_KEY_NOTE
+    if reason == "DEVICE_BUSY":
+        return BUSY_NOTE
+    return "Setup did not complete (" + error + "). Check Ethernet, IP/port and communication key, then retry. Contact " + SUPPORT + " if needed."
+
+
+def skipped_note(store, devices):
+    """Local-only suffix for the device status line: records the last read could not use."""
+    orphans, undecodable = store.skipped_totals([d["_id"] for d in devices if d.get("_id")])
+    count = orphans + undecodable
+    if not count:
+        return ""
+    return " · " + str(count) + (" record" if count == 1 else " records") + " skipped (deleted members/invalid times; see log)"
 
 
 def show(runtime, config_path=None):
@@ -57,9 +79,9 @@ def show(runtime, config_path=None):
     def work(kind, action):
         def execute():
             try:
-                messages.put((kind, action(), None))
+                messages.put((kind, action(), None, None))
             except Exception as exc:
-                messages.put((kind, None, error_code(exc)))
+                messages.put((kind, None, error_code(exc), exc.reason if isinstance(exc, AdapterError) else None))
         threading.Thread(target=execute, daemon=True).start()
     def pair():
         nonlocal busy
@@ -157,7 +179,8 @@ def show(runtime, config_path=None):
             secrets.save(values)
             device = {"adapter": "zk-tcp", "ip": address, "port": number, "timezone": timezone_name,
                       "historySince": start.isoformat(), "eventPolicy": event_policy}
-            adapter = adapter_for(device, runtime.config, runtime.store)
+            adapter = adapter_for(device, runtime.config, runtime.store,
+                                  lambda: closed.is_set() or runtime.stop.is_set())
             identity = adapter.health()
             result = runtime.cloud.request("POST", "/connectors/me/devices", {**device, "expectedIdentity": identity})
             device["_id"] = result["deviceId"]
@@ -218,7 +241,7 @@ def show(runtime, config_path=None):
         nonlocal busy, polling, device_polling, candidates, auto_scanned, nics, choices, preferred
         try:
             while True:
-                kind, result, error = messages.get_nowait()
+                kind, result, error, reason = messages.get_nowait()
                 if kind == "server":
                     polling = False
                     if error:
@@ -247,7 +270,8 @@ def show(runtime, config_path=None):
                             auto_scanned = False
                         fresh = [d for d in devices if d.get("report", {}).get("reachable") and d["report"].get("receivedAt") and
                                  (datetime.now(timezone.utc) - datetime.fromisoformat(d["report"]["receivedAt"].replace("Z", "+00:00"))).total_seconds() < 180]
-                        device_status.set("Device: connection ready · " + fresh[0]["identity"] if fresh else "Device: waiting for a successful data read")
+                        device_status.set(("Device: connection ready · " + fresh[0]["identity"] if fresh else "Device: waiting for a successful data read")
+                                          + skipped_note(runtime.store, devices))
                         health = runtime.store.get("health", {})
                         synced = health.get("lastAcknowledgedUpload")
                         sync_status.set(("Attendance: last cloud acknowledgement " + synced if synced else "Attendance: no acknowledged upload yet") + (" · History gap detected" if health.get("errorCode") == "DATA_GAP" else ""))
@@ -261,9 +285,9 @@ def show(runtime, config_path=None):
                     if error and kind == "service":
                         note.set("Background sync could not be changed. Open the app from Applications, check System Settings → General → Login Items, and retry (" + error + ").")
                     elif error:
-                        note.set(("Server pairing could not complete (" + error + "). Check internet access and secure credential storage, then retry. A saved pairing is retained." if kind == "pair" else "Setup did not complete (" + error + "). Check Ethernet, IP/port and communication key, then retry. Contact " + SUPPORT + " if needed."))
+                        note.set(("Server pairing could not complete (" + error + "). Check internet access and secure credential storage, then retry. A saved pairing is retained." if kind == "pair" else setup_failure_note(error, reason)))
                         diagnostics.configure(state="normal"); diagnostics.delete("1.0", "end")
-                        diagnostics.insert("1.0", json.dumps({"time": utc_now(), "appVersion": __version__, "operation": kind, "errorCode": error,
+                        diagnostics.insert("1.0", json.dumps({"time": utc_now(), "appVersion": __version__, "operation": kind, "errorCode": error, "reason": reason,
                                                           "ip": ip.get(), "port": port.get(), "timezone": zone.get()}, indent=2))
                         diagnostics.configure(state="disabled")
                     elif kind == "service":
